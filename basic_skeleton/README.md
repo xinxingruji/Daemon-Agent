@@ -124,7 +124,7 @@ sekleton/
 
 路由规则可以概括为：
 
-- `decision_score >= 0.55` 时路由到 `large`。
+- `decision_score >= 0.45` 时路由到 `large`。
 - 否则路由到 `small`。
 
 这意味着系统默认偏向成本更低的小模型，但会在高风险任务上提前升级。
@@ -245,7 +245,7 @@ sekleton/
 
 它做了两件事：
 
-- 初始化 `SmallModel` 和 `LargeModel`。
+- 初始化 `SmallModel`（本地 Ollama qwen2.5:1.5b）和 `LargeModel`（DeepSeek Pro API）。
 - 根据 `model_name` 分发到对应模型的 `generate()` 方法。
 
 主要方法：
@@ -256,7 +256,7 @@ sekleton/
 
 ### `models/small_model.py`
 
-这是小模型封装，支持两种模式：
+这是小模型封装，使用本地 Ollama + qwen2.5:1.5b，支持两种模式：
 
 - 如果本地 Ollama 可用，就调用真实模型。
 - 如果不可用，就退回到 Mock 逻辑。
@@ -286,9 +286,9 @@ sekleton/
 
 ### `models/large_model.py`
 
-这是大模型封装，负责在需要升级时生成更高质量的答案。
+这是大模型封装，使用 **DeepSeek Pro (deepseek-reasoner) API**，负责在需要升级时生成更高质量的答案。
 
-它同样通过本地 Ollama 的 HTTP 接口调用模型，但会根据输入内容区分两类场景：
+它通过 DeepSeek API 调用模型，根据输入内容区分两类场景：
 
 - 常规高难度请求：直接作为技术问答处理。
 - 修复请求：当小模型失败后，带着弱草稿和质量问题一起修复。
@@ -303,10 +303,11 @@ sekleton/
 它和小模型的区别是：
 
 - 系统更偏向用它做最终修复。
-- 提示词更强调“结构化、具体、完整”。
+- 提示词更强调”结构化、具体、完整”。
 - 在修复模式下会显式要求解决弱草稿的问题，不要道歉，只输出改进后的答案。
+- API Key 通过 `config.json` 或环境变量 `DEEPSEEK_API_KEY` 配置。
 
-如果本地 Ollama 不可用，大模型路径会返回系统错误信息，因此如果你希望完整体验升级链路，最好启动本地 Ollama 服务。
+如果本地 Ollama 不可用，大模型路径不会受影响（走远程 API），小模型则降级到 Mock 模式。
 
 ### `prompts/judge_prompt.py`
 
@@ -413,6 +414,34 @@ python test_semantic_routing.py
 
 用于验证路由、升级和统计是否正常。
 
+## 配置说明
+
+### DeepSeek API Key
+
+大模型使用 DeepSeek Pro API，需要配置 API Key（二选一）：
+
+**方式一**：编辑 `config.json`
+```json
+{
+  "deepseek_api_key": "sk-your-key-here"
+}
+```
+
+**方式二**：设置环境变量
+```bash
+export DEEPSEEK_API_KEY=sk-your-key-here
+```
+
+### Ollama（可选）
+
+小模型默认使用本地 Ollama 的 qwen2.5:1.5b。如果尚未安装：
+
+```bash
+ollama pull qwen2.5:1.5b
+```
+
+如果 Ollama 不可用，小模型会自动降级到 Mock 模式（关键词规则 + 固定文本），大模型不受影响。
+
 ## 运行时输出示例
 
 ```text
@@ -461,8 +490,8 @@ python test_semantic_routing.py
 
 ## 当前限制
 
-- 小模型和大模型都默认走本地 Ollama 接口，需要本机服务可用才能体验真实推理。
-- 如果没有 Ollama，大模型路径会返回系统错误字符串。
+- 小模型走本地 Ollama + qwen2.5:1.5b，需要本机安装 Ollama 才能体验真实推理。
+- 如果没有 Ollama，小模型会降级到 Mock 模式（固定文本），大模型 DeepSeek Pro 不受影响。
 - 语义路由仍是轻量近似实现，不是训练好的嵌入模型。
 - 当前学习机制是统计和记录型的，还没有自动调阈值的在线优化逻辑。
 

@@ -58,6 +58,72 @@
       ],
       "small_answer": "I don't know.",
       "final_answer": "To properly address 'How to debug Python code?':\nThe previous response was too vague. Here's a concrete approach:\n1. Break down the problem into specific steps\n2. Provide code examples or concrete techniques\n3. Address edge cases explicitly\n4. Include clear implementation guidance\nThis addresses the issue: judge_bad"
+    },
+    {
+      "timestamp": 1778845674,
+      "task_type": "coding",
+      "selected_model": "small",
+      "query_preview": "What is Python?",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "[UNCERTAIN_MODEL_OUTPUT] I'm not entirely sure about this... This might require more specialized knowledge.",
+      "final_answer": "[System Error] Fallback model failed: <urlopen error [WinError 10061] \u7531\u4e8e\u76ee\u6807\u8ba1\u7b97\u673a\u79ef\u6781\u62d2\u7edd\uff0c\u65e0\u6cd5\u8fde\u63a5\u3002>"
+    },
+    {
+      "timestamp": 1778845878,
+      "task_type": "coding",
+      "selected_model": "small",
+      "query_preview": "What is Python?",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "[UNCERTAIN_MODEL_OUTPUT] I'm not entirely sure about this... This might require more specialized knowledge.",
+      "final_answer": "[System Error] DEEPSEEK_API_KEY not set. Cannot call large model."
+    },
+    {
+      "timestamp": 1778846381,
+      "task_type": "analysis",
+      "selected_model": "small",
+      "query_preview": "Explain how distributed consensus algorithms work",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "[UNCERTAIN_MODEL_OUTPUT] I'm not entirely sure about this... This might require more specialized knowledge.",
+      "final_answer": "Distributed consensus algorithms enable multiple nodes in a distributed system to agree on a single value or state, despite the possibility of failures (crashes, network delays, or malicious behavior). They are foundational for fault-tolerant coordination in systems like databases, blockchains, and configuration services.\n\n### Core Concepts\n- **Agreement**: All non-faulty nodes must decide on the same value.\n- **Validity**: The decided value must be one proposed by some node.\n- **Termination**: Every non-faulty node eventually decides.\n- **Fault tolerance**: The algorithm must work correctly even if some nodes fail. A common bound is that fewer than half of the nodes can fail (Byzantine) or fewer than a majority can crash (for crash\u2011fault tolerant algorithms).\n\n### Common Approaches\n1. **Paxos** (classic, but complex to implement correctly)  \n   - Uses a **proposer** (leader) and **acceptors** (voters).  \n   - Phases: Prepare \u2192 Promise \u2192 Accept \u2192 Learned.  \n   - Requires a majority of acceptors to agree on a (proposal number, value) pair.\n\n2. **Raft** (designed for understandability, widely used in production)  \n   - Divides time into **terms**, with a single leader per term.  \n   - Leader handles all client requests and replicates **log entries** to followers via **AppendEntries** RPC.  \n   - **Election**: Followers timeout \u2192 become candidate \u2192 request votes \u2192 if majority votes, becomes leader.  \n   - **Safety**: Only the leader with the most up\u2011to\u2011date log can become leader; entries are committed only after replication to a majority.\n\n3. **PBFT** (Practical Byzantine Fault Tolerance, for malicious failures)  \n   - Requires **3f+1** nodes to tolerate f Byzantine faults.  \n   - Uses a primary (leader) and replicas; message rounds: pre\u2011prepare \u2192 prepare \u2192 commit.  \n   - Stronger guarantees against arbitrary failures.\n\n### Common Steps in a Crash\u2011Fault Tolerant Algorithm (e.g., Raft)\n- **Leader Election**: Nodes start as followers; if they don\u2019t hear from the leader, they become candidates and request votes. The candidate that receives votes from a majority becomes the leader.\n- **Log Replication**: Leader appends client commands to its log, sends AppendEntries to followers. When a majority acknowledge, the entry is committed and applied to state machine.\n- **Consistency**: All non\u2011faulty nodes eventually show the same sequence of committed entries.\n\n### Key Challenges\n- **FLP impossibility**: In an asynchronous system, it is impossible to guarantee consensus with even a single crash failure if the algorithm is deterministic. Practical systems use timeouts and eventual synchrony.\n- **Network Partition**: A leader from one partition cannot reach a majority; consensus stalls until the partition heals.\n\n### Real\u2011World Examples\n- **ZooKeeper** uses **Zab** (a variant of Paxos) for leader election and atomic broadcast.\n- **etcd** and **Consul** use **Raft** for key\u2011value storage.\n- **Bitcoin / Ethereum** use **Proof\u2011of\u2011Work** or **Proof\u2011of\u2011Stake** (probabilistic consensus for open, Byzantine environments).\n\nIn summary, distributed consensus algorithms provide a robust way to achieve agreement in unreliable networks. Raft is often the best starting point for learning due to its clarity, while Paxos underpins many mature systems. For environments with malicious nodes, Byzantine\u2011fault\u2011tolerant algorithms like PBFT are necessary but require more nodes and message overhead."
+    },
+    {
+      "timestamp": 1778846416,
+      "task_type": "analysis",
+      "selected_model": "small",
+      "query_preview": "Explain how distributed consensus algorithms work",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "[UNCERTAIN_MODEL_OUTPUT] I'm not entirely sure about this... This might require more specialized knowledge.",
+      "final_answer": "Distributed consensus algorithms allow multiple nodes (servers) in a network to agree on a single value or sequence of values despite failures or message delays. They are the foundation of fault-tolerant systems like databases, blockchains, and coordination services.\n\n### Core Problem\nIn a distributed system, nodes can crash, messages can be lost or delayed, and network partitions can occur. Consensus algorithms must ensure that:\n- **Safety**: All non-faulty nodes eventually agree on the same value, and no two nodes decide different values.\n- **Liveness**: The system continues to make progress (eventually decides on a value) even if some nodes fail.\n- **Fault tolerance**: The algorithm can tolerate up to a certain number of failures (typically a minority of nodes).\n\n### Common Families of Consensus Algorithms\n\n1. **Leader-based (Paxos, Raft)**\n   - Designate one node as the leader (proposer) that drives the decision.\n   - **Process** (simplified):\n     1. **Leader election** \u2013 Nodes choose a leader via timeouts and voting.\n     2. **Proposal** \u2013 Leader sends a proposed value to all nodes (acceptors).\n     3. **Acceptance** \u2013 A majority of nodes (quorum) must acknowledge the proposal. Only one value can obtain a majority, ensuring uniqueness.\n     4. **Commit** \u2013 Once a quorum accepts, the leader broadcasts the decision.\n   - Handles failures by re\u2011electing a new leader if the current one crashes. Raft is a more understandable variant of Paxos, with predictable leader election and log replication.\n\n2. **Byzantine Fault\u2011Tolerant (BFT)** \u2013 e.g., PBFT, used in blockchains.\n   - Assumes nodes can behave arbitrarily (Byzantine failures), not just crash.\n   - Requires at least 3f+1 nodes to tolerate f Byzantine failures.\n   - Process involves multiple rounds of message exchanges (pre\u2011prepare, prepare, commit) to achieve agreement even when some nodes lie.\n\n3. **Crash\u2011fault tolerant (CFT)** \u2013 e.g., Paxos, Raft, Zab.\n   - Assume nodes only fail by stopping (no malicious behavior).\n   - Usually require a majority (2f+1 nodes to tolerate f failures).\n\n### Key Mechanisms\n- **Quorums**: A majority set of nodes that must agree. Any two quorums overlap, preventing conflicting decisions.\n- **Leader leases/timeouts**: To avoid two leaders simultaneously (split\u2011brain), nodes use timeouts to trigger new elections only when they suspect the current leader is down.\n- **Logs**: Consensus algorithms maintain an ordered log of decisions (operations) that is replicated across nodes. The log ensures total order and recovery after crashes.\n\n### Example (Raft)\n1. Nodes start as followers. If a follower doesn\u2019t hear from a leader within an election timeout, it becomes a candidate and starts an election.\n2. The candidate requests votes. If it gets a majority, it becomes the leader for a term.\n3. The leader receives client requests, appends them to its log, and sends `AppendEntries` to followers.\n4. Once a majority of followers replicate the entry, the leader commits it and informs the followers.\n5. If the leader crashes, a new election begins, and the new leader continues from the last committed log entry.\n\nThese algorithms are widely deployed: etcd uses Raft, Google\u2019s Chubby uses Paxos, and Hyperledger Fabric uses PBFT for permissioned blockchains."
+    },
+    {
+      "timestamp": 1778846467,
+      "task_type": "coding",
+      "selected_model": "small",
+      "query_preview": "What is Python?",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "[UNCERTAIN_MODEL_OUTPUT] I'm not entirely sure about this... This might require more specialized knowledge.",
+      "final_answer": "Python is a high-level, interpreted programming language created by Guido van Rossum and first released in 1991. It emphasizes code readability through its use of significant indentation and a clean, expressive syntax. Python is dynamically typed and garbage-collected, and it supports multiple programming paradigms, including procedural, object-oriented, and functional programming.\n\nKey characteristics:\n- **Interpreted**: Python code is executed line by line by the Python interpreter, making development fast and interactive.\n- **Versatile**: Used in web development (Django, Flask), data science and machine learning (NumPy, pandas, scikit-learn), automation, scripting, scientific computing, artificial intelligence, and more.\n- **Extensive standard library**: \"Batteries included\" philosophy provides modules for tasks like file I/O, networking, and string processing.\n- **Cross-platform**: Runs on Windows, macOS, Linux, and many other platforms.\n- **Large ecosystem**: Thousands of third-party packages available via PyPI (Python Package Index).\n- **Community-driven**: Open-source with a large, active community that contributes to documentation, forums, and libraries.\n\nPython is often recommended for beginners due to its readability, but it is also powerful enough for professional-grade applications used by companies like Google, Netflix, and NASA."
+    },
+    {
+      "timestamp": 1778849631,
+      "task_type": "generic",
+      "selected_model": "small",
+      "query_preview": "\u7ed9\u6211\u8bc1\u660e\u4e00\u4e0b\u8d39\u9a6c\u5927\u5b9a\u7406",
+      "reason": [
+        "judge_bad"
+      ],
+      "small_answer": "\u5bf9\u4e0d\u8d77\uff0c\u6211\u65e0\u6cd5\u63d0\u4f9b\u5173\u4e8e\u8d39\u9a6c\u5927\u5b9a\u7406\u7684\u8bc1\u660e\u3002\u8fd9\u662f\u4e00\u4e2a\u975e\u5e38\u590d\u6742\u7684\u6570\u5b66\u95ee\u9898\uff0c\u901a\u5e38\u9700\u8981\u4e13\u4e1a\u7684\u77e5\u8bc6\u548c\u8ba1\u7b97\u80fd\u529b\u6765\u89e3\u51b3\u3002\u5982\u679c\u60a8\u5bf9\u8fd9\u4e2a\u8bdd\u9898\u611f\u5174\u8da3\uff0c\u5efa\u8bae\u60a8\u67e5\u627e\u4e00\u4e9b\u53ef\u9760\u7684\u5b66\u672f\u8d44\u6e90\u6216\u8005\u54a8\u8be2\u76f8\u5173\u7684\u6570\u5b66\u4e13\u5bb6\u3002\u6211\u53ef\u4ee5\u5e2e\u52a9\u60a8\u627e\u5230\u8fd9\u4e9b\u4fe1\u606f\uff0c\u5e76\u4e14\u5728\u7406\u89e3\u8fc7\u7a0b\u4e2d\u63d0\u4f9b\u6307\u5bfc\u548c\u652f\u6301\u3002",
+      "final_answer": "**\u8d39\u9a6c\u5927\u5b9a\u7406\uff08Fermat's Last Theorem\uff09\u7684\u73b0\u4ee3\u8bc1\u660e\u6982\u8981**\n\n\u8d39\u9a6c\u5927\u5b9a\u7406\u9648\u8ff0\u4e3a\uff1a\u5bf9\u4e8e\u4efb\u4f55\u5927\u4e8e 2 \u7684\u6574\u6570 \\( n \\)\uff0c\u65b9\u7a0b  \n\\[\nx^n + y^n = z^n\n\\]  \n\u6ca1\u6709\u6b63\u6574\u6570\u89e3 \\((x, y, z)\\)\u3002\u8be5\u5b9a\u7406\u7531\u76ae\u57c3\u5c14\u00b7\u5fb7\u00b7\u8d39\u9a6c\u4e8e 1637 \u5e74\u63d0\u51fa\uff0c\u4f46\u76f4\u5230 1994 \u5e74\u624d\u7531\u5b89\u5fb7\u9c81\u00b7\u6000\u5c14\u65af\uff08Andrew Wiles\uff09\u7ed9\u51fa\u5b8c\u6574\u8bc1\u660e\uff0c\u968f\u540e\u7531\u7406\u67e5\u5fb7\u00b7\u6cf0\u52d2\uff08Richard Taylor\uff09\u534f\u52a9\u4fee\u6b63\u4e86\u4e00\u4e2a\u6f0f\u6d1e\u3002\n\n\u6000\u5c14\u65af\u7684\u8bc1\u660e\u6df1\u5ea6\u4f9d\u8d56\u73b0\u4ee3\u6570\u8bba\uff0c\u6838\u5fc3\u662f\u5c06\u8d39\u9a6c\u65b9\u7a0b\u4e0e\u692d\u5706\u66f2\u7ebf\u53ca\u6a21\u5f62\u5f0f\u8054\u7cfb\u8d77\u6765\u3002\u4ee5\u4e0b\u662f\u8bc1\u660e\u7684\u4e3b\u8981\u903b\u8f91\u94fe\u6761\uff1a\n\n---\n\n### 1. \u5f52\u7ea6\u5230 \\( n = 4 \\) \u548c\u5947\u7d20\u6570\u7684\u60c5\u5f62\n\u82e5 \\( n > 2 \\) \u6709\u53cd\u4f8b\uff0c\u5219 \\( n \\) \u5fc5\u5305\u542b\u56e0\u5b50 4 \u6216\u5947\u7d20\u6570 \\( p \\)\u3002  \n- \\( n = 4 \\) \u7684\u60c5\u5f62\u5df2\u88ab\u8d39\u9a6c\u672c\u4eba\u7528\u65e0\u7a77\u964d\u6cd5\u8bc1\u660e\u65e0\u89e3\uff08\u5373\u692d\u5706\u66f2\u7ebf \\( x^4 + y^4 = z^4 \\) \u65e0\u975e\u5e73\u51e1\u89e3\uff09\u3002  \n- \u56e0\u6b64\u53ea\u9700\u8bc1\u660e\u5bf9\u6240\u6709\u5947\u7d20\u6570 \\( p \\geq 3 \\)\uff0c\u65b9\u7a0b \\( x^p + y^p = z^p \\) \u65e0\u6b63\u6574\u6570\u89e3\u3002\n\n---\n\n### 2. \u8d39\u9a6c\u65b9\u7a0b\u4e0e\u5f17\u96f7\u692d\u5706\u66f2\u7ebf\n\u5047\u8bbe\u5b58\u5728\u4e00\u7ec4\u4e92\u7d20\u7684\u6b63\u6574\u6570\u89e3 \\((a, b, c)\\) \u6ee1\u8db3 \\( a^p + b^p = c^p \\)\u3002\u5fb7\u56fd\u6570\u5b66\u5bb6\u683c\u54c8\u5fb7\u00b7\u5f17\u96f7\uff08Gerhard Frey\uff09\u5728 1985 \u5e74\u6307\u51fa\uff0c\u53ef\u4ee5\u6784\u9020\u4e00\u6761\u692d\u5706\u66f2\u7ebf\uff08\u540e\u6765\u79f0\u4e3a\u5f17\u96f7\u66f2\u7ebf\uff09\uff1a\n\\[\nE: y^2 = x (x - a^p) (x + b^p)\n\\]\n\u8be5\u66f2\u7ebf\u7684\u5224\u522b\u5f0f\u4e0e \\( a, b, c \\) \u7684\u4e58\u79ef\u6709\u7279\u6b8a\u5173\u7cfb\u3002\u5f17\u96f7\u63a8\u6d4b\uff1a\u5982\u679c\u89e3\u5b58\u5728\uff0c\u5219\u8fd9\u6761\u692d\u5706\u66f2\u7ebf\u4f1a\u662f\u201c\u534a\u7a33\u5b9a\u201d\u7684\uff0c\u4e14\u5176\u67d0\u4e9b\u6027\u8d28\uff08\u5982\u4f3d\u7f57\u74e6\u8868\u793a\u7684\u6a21\u6027\uff09\u5c06\u8fdd\u53cd\u8c37\u5c71\u2013\u5fd7\u6751\u731c\u60f3\uff08\u5373\u6240\u6709\u6709\u7406\u6570\u57df\u4e0a\u7684\u692d\u5706\u66f2\u7ebf\u90fd\u662f\u6a21\u7684\uff09\u3002\n\n---\n\n### 3. \u8c37\u5c71\u2013\u5fd7\u6751\u2013\u97e6\u4f0a\u731c\u60f3\uff08\u73b0\u5df2\u8bc1\u660e\uff09\n\u8be5\u731c\u60f3\u79f0\uff1a\u4efb\u4f55\u5b9a\u4e49\u5728\u6709\u7406\u6570\u57df\u4e0a\u7684\u692d\u5706\u66f2\u7ebf\u90fd\u53ef\u4ee5\u901a\u8fc7\u4e00\u4e2a\u6a21\u5f62\u5f0f\uff08\u6a21\u53c2\u6570\u5316\uff09\u6765\u53c2\u6570\u5316\u3002\u8fd9\u662f\u6000\u5c14\u65af\u8bc1\u660e\u7684\u6838\u5fc3\u5de5\u5177\u3002\u4e3a\u4e86\u8bc1\u660e\u8d39\u9a6c\u5927\u5b9a\u7406\uff0c\u6000\u5c14\u65af\u5b9e\u9645\u4e0a\u8bc1\u660e\u4e86\u4e00\u4e2a\u8db3\u591f\u5f3a\u7684\u7279\u4f8b\uff1a**\u6240\u6709\u534a\u7a33\u5b9a\u7684\u692d\u5706\u66f2\u7ebf\u90fd\u662f\u6a21\u7684**\u3002\n\n\u5f17\u96f7\u66f2\u7ebf\u7684\u534a\u7a33\u5b9a\u6027\u7531\u5176\u6784\u9020\u5f97\u51fa\uff0c\u56e0\u6b64\u82e5\u89e3\u5b58\u5728\uff0c\u5f17\u96f7\u66f2\u7ebf\u5fc5\u662f\u6a21\u7684\u3002\n\n---\n\n### 4. \u6a21\u5f62\u5f0f\u4e0e\u4f3d\u7f57\u74e6\u8868\u793a\n\u692d\u5706\u66f2\u7ebf\u7684\u6a21\u6027\u7b49\u4ef7\u4e8e\u5176 \\( p \\)-\u8fdb\u4f3d\u7f57\u74e6\u8868\u793a\u4e0e\u67d0\u4e2a\u6a21\u5f62\u5f0f\u76f8\u5173\u8054\u3002\u6000\u5c14\u65af\u4f7f\u7528\u201c\u5ca9\u6cfd\u7406\u8bba\u201d\u548c\u201c\u53d8\u5f62\u7406\u8bba\u201d\u6765\u6bd4\u8f83\u4e24\u4e2a\u4f3d\u7f57\u74e6\u8868\u793a\uff1a\u4e00\u4e2a\u6765\u81ea\u5f17\u96f7\u66f2\u7ebf\uff0c\u53e6\u4e00\u4e2a\u6765\u81ea\u5047\u8bbe\u7684\u6a21\u5f62\u5f0f\u3002\u4ed6\u8bc1\u660e\u4e86\u82e5\u5f17\u96f7\u66f2\u7ebf\u662f\u6a21\u7684\uff0c\u5219\u5176\u4f3d\u7f57\u74e6\u8868\u793a\u5fc5\u987b\u6ee1\u8db3\u67d0\u4e9b\u9650\u5236\uff0c\u800c\u8fd9\u4e9b\u9650\u5236\u4f1a\u5bfc\u81f4\u77db\u76fe\u2014\u2014\u6a21\u5f62\u5f0f\u5bf9\u5e94\u7684\u6743\u91cd\u5fc5\u987b\u4e3a 2\uff0c\u800c\u5f17\u96f7\u66f2\u7ebf\u7684\u67d0\u4e9b\u5c40\u90e8\u6027\u8d28\u8feb\u4f7f\u6743\u91cd\u4e3a \\( p \\)\uff08\u7d20\u6570\uff09\uff0c\u4e24\u8005\u65e0\u6cd5\u540c\u65f6\u6210\u7acb\u3002\n\n---\n\n### 5. \u5f97\u51fa\u77db\u76fe\n\u901a\u8fc7\u7ec6\u81f4\u7684\u6570\u8bba\u5206\u6790\uff08\u7279\u522b\u662f\u745f\u5c14\uff08Serre\uff09\u7684\u731c\u60f3\u548c\u6885\u7956\u5c14\uff08Mazur\uff09\u7684\u53d8\u5f62\u73af\u7406\u8bba\uff09\uff0c\u6000\u5c14\u65af\u8bc1\u660e\u4e86\u5f17\u96f7\u66f2\u7ebf\u4e0d\u53ef\u80fd\u540c\u65f6\u662f\u6a21\u7684\u4e14\u5177\u6709\u7684\u4f3d\u7f57\u74e6\u8868\u793a\u4e0e\u89e3\u7684\u5b58\u5728\u6027\u76f8\u5bb9\u3002\u56e0\u6b64\uff0c\u5f17\u96f7\u66f2\u7ebf\u4e0d\u80fd\u5b58\u5728\uff0c\u539f\u59cb\u5047\u8bbe\u7684\u6574\u6570\u89e3 \\( (a,b,c) \\) \u4e5f\u4e0d\u5b58\u5728\u3002\n\n---\n\n### 6. \u6700\u7ec8\u7ed3\u8bba\n\u7531\u4e8e\u6240\u6709\u5047\u8bbe\u90fd\u5bfc\u81f4\u903b\u8f91\u77db\u76fe\uff0c\u56e0\u6b64\u5bf9\u4efb\u4f55\u7d20\u6570 \\( p \\geq 3 \\)\uff0c\u65b9\u7a0b \\( x^p + y^p = z^p \\) \u65e0\u6b63\u6574\u6570\u89e3\u3002\u7ed3\u5408 \\( n=4 \\) \u5df2\u88ab\u8bc1\u660e\uff0c\u8d39\u9a6c\u5927\u5b9a\u7406\u5bf9\u6240\u6709 \\( n>2 \\) \u6210\u7acb\u3002\n\n---\n\n### \u8865\u5145\u8bf4\u660e\n- \u6000\u5c14\u65af\u7684\u8bc1\u660e\u957f\u8fbe\u6570\u767e\u9875\uff0c\u6d89\u53ca\u692d\u5706\u66f2\u7ebf\u3001\u6a21\u5f62\u5f0f\u3001\u4f3d\u7f57\u74e6\u8868\u793a\u3001\u53d8\u5f62\u73af\u3001\u4ea8\u6cfd\u5c14\u63d0\u5347\u7b49\u6df1\u5c42\u6982\u5ff5\u3002\u4e0a\u8ff0\u4ec5\u4e3a\u9ad8\u5c42\u6b21\u7684\u903b\u8f91\u94fe\u6761\uff0c\u65e0\u6cd5\u5728\u6709\u9650\u7bc7\u5e45\u5185\u5c55\u5f00\u5b8c\u6574\u8bc1\u660e\u7ec6\u8282\u3002\n- \u5982\u679c\u4f60\u60f3\u6df1\u5165\u4e86\u89e3\u5177\u4f53\u67d0\u4e00\u6b65\u9aa4\uff08\u4f8b\u5982\u5f17\u96f7\u66f2\u7ebf\u7684\u6784\u9020\u3001\u585e\u5c14\u731c\u60f3\u7684\u4f5c\u7528\uff09\uff0c\u6211\u53ef\u4ee5\u8fdb\u4e00\u6b65\u89e3\u91ca\u6838\u5fc3\u601d\u8def\u6216\u63a8\u8350\u6743\u5a01\u6587\u732e\uff08\u5982\u300a\u8d39\u9a6c\u5927\u5b9a\u7406\uff1a\u6000\u5c14\u65af\u7684\u8bc1\u660e\u300b\u6216\u6234\u5c14\u2022\u5965\u5c14\u68ee\u7684\u539f\u7406\u6027\u9610\u8ff0\uff09\u3002\n\n\u8fd9\u4e2a\u8bc1\u660e\u662f\u73b0\u4ee3\u6570\u5b66\u7684\u5dc5\u5cf0\u6210\u5c31\u4e4b\u4e00\uff0c\u5b83\u5de7\u5999\u5730\u5c06\u770b\u4f3c\u521d\u7b49\u7684\u95ee\u9898\u4e0e\u6700\u6df1\u5965\u7684\u6570\u5b66\u7ed3\u6784\u8054\u7cfb\u8d77\u6765\u3002\u5982\u679c\u4f60\u5bf9\u67d0\u4e00\u73af\u8282\u611f\u5174\u8da3\uff0c\u6211\u4eec\u53ef\u4ee5\u7ee7\u7eed\u63a2\u8ba8\u3002"
     }
   ],
   "metadata": {
@@ -135,6 +201,198 @@
       "selected_model": "small",
       "final_quality": "GOOD",
       "was_correct": true
+    },
+    {
+      "timestamp": 1778845674,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778845878,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778846149,
+      "query_preview": "How to print hello world?",
+      "predicted_complexity": 0.2,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846149,
+      "query_preview": "Garbage collection optimization",
+      "predicted_complexity": 0.8,
+      "selected_model": "large",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846149,
+      "query_preview": "Python list methods",
+      "predicted_complexity": 0.3,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778846165,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846179,
+      "query_preview": "Design a distributed consensus algorithm handling ",
+      "predicted_complexity": 0.522,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846225,
+      "query_preview": "Write a Python decorator that caches function resu",
+      "predicted_complexity": 0.475,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846241,
+      "query_preview": "Explain the exact memory layout and page table int",
+      "predicted_complexity": 0.521,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778846381,
+      "query_preview": "Explain how distributed consensus algorithms work",
+      "predicted_complexity": 0.527,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778846416,
+      "query_preview": "Explain how distributed consensus algorithms work",
+      "predicted_complexity": 0.527,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778846467,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778849424,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849445,
+      "query_preview": "What is Python?",
+      "predicted_complexity": 0.365,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849467,
+      "query_preview": "Design a distributed consensus algorithm handling ",
+      "predicted_complexity": 0.522,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849469,
+      "query_preview": "\u7ed9\u6211\u89e3\u91ca\u4e00\u4e0b\u4ec0\u4e48\u662fcpp",
+      "predicted_complexity": 0.5,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849513,
+      "query_preview": "Write a Python metaclass that implements a singlet",
+      "predicted_complexity": 0.467,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849535,
+      "query_preview": "\u7528python\u5b9e\u73b0\u4e00\u4e2aLSM-Tree\u5b58\u50a8\u5f15\u64ce\u7684compaction\u7b56\u7565\uff0c\u5305\u62ecsize-tiered",
+      "predicted_complexity": 0.5,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849612,
+      "query_preview": "Explain how distributed consensus algorithms work",
+      "predicted_complexity": 0.527,
+      "selected_model": "large",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849630,
+      "query_preview": "What is a Python list?",
+      "predicted_complexity": 0.358,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849631,
+      "query_preview": "\u7ed9\u6211\u8bc1\u660e\u4e00\u4e0b\u8d39\u9a6c\u5927\u5b9a\u7406",
+      "predicted_complexity": 0.5,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
+    },
+    {
+      "timestamp": 1778849939,
+      "query_preview": "How to print hello world?",
+      "predicted_complexity": 0.2,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849939,
+      "query_preview": "Garbage collection optimization",
+      "predicted_complexity": 0.8,
+      "selected_model": "large",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1778849939,
+      "query_preview": "Python list methods",
+      "predicted_complexity": 0.3,
+      "selected_model": "small",
+      "final_quality": "BAD",
+      "was_correct": false
     }
   ]
 }

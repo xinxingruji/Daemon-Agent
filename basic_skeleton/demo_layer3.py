@@ -42,10 +42,10 @@ def demo_semantic_complexity():
         
         # Show similar seeds for debugging
         similarities = sr.debug_similarity(query)
-        if similarities["easy_matches"]:
-            print(f"    Similar easy: {similarities['easy_matches'][0][0][:40]}")
-        if similarities["hard_matches"]:
-            print(f"    Similar hard: {similarities['hard_matches'][0][0][:40]}")
+        if similarities["easy_similarities"]:
+            print(f"    Similar easy: {similarities['easy_similarities'][0][0][:40]}")
+        if similarities["hard_similarities"]:
+            print(f"    Similar hard: {similarities['hard_similarities'][0][0][:40]}")
         print()
 
 

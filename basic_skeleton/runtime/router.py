@@ -35,7 +35,7 @@ class Router:
         - 语义复杂度: 0.3
         - 长度/标记复杂度: 0.2
         
-        决策阈值：总分 >= 0.55 → 选择 "large"
+        决策阈值：总分 >= 0.45 → 选择 "large"
         """
         q = query.strip()
         q_lower = q.lower()
@@ -90,7 +90,7 @@ class Router:
             decision_factors.append("complex_markers")
 
         # 最终路由决策
-        decision = "large" if decision_score >= 0.55 else "small"
+        decision = "large" if decision_score >= 0.45 else "small"
         reason = (
             " | ".join(decision_factors) if decision_factors else "default_cost_first"
         )
