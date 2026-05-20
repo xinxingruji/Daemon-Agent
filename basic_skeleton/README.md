@@ -1,478 +1,364 @@
-# Lightweight Adaptive Inference Runtime
+# basic_skeleton — Agent 框架 总览
 
-这是一个面向演示和实验的自适应推理运行时，用最少的依赖实现“先便宜模型、再质量评估、必要时升级大模型、并把失败经验写回本地”的闭环。
+这是一个本地化、轻量但完整的“自适应推理 + Agent”框架，实现了从路由、模型调用、评估到升级及失败记忆的闭环。
 
-项目的目标不是把回答做得最复杂，而是把“路由、评估、升级、记忆、可观测性”这几个环节串起来，形成一个可以持续改进的最小可用系统。
+下面文档在一个文件里描述：组成、运行流程、模块说明、每个重要文件用途，以及与 `learn-claude-code/agents/s_full.py` 的对比。
 
-## 项目目标
+## 快速开始
 
-- 先用低成本模型处理简单任务，尽量节省推理成本。
-- 对模型回答进行自动判定，发现质量不足时立即升级。
-- 把失败案例和路由反馈保存到本地 JSON 文件，供后续决策参考。
-- 使用语义复杂度、历史失败率、长度和关键词等多个因子做路由，而不是只靠硬规则。
-- 保持实现足够轻量，默认只依赖 Python 标准库。
-
-## 整体工作流
-
-用户输入查询后，系统会按下面的顺序执行：
-
-1. `Router` 读取查询内容，并结合本地失败记忆、语义复杂度和关键词特征决定先走 `small` 还是 `large`。
-2. `ModelManager` 调用对应模型生成初稿。
-3. 如果路由到了 `large`，系统直接返回结果，并记录这次路由反馈。
-4. 如果先走 `small`，`Evaluator` 会检查答案是否不可信、过短或被判官模型判为 `BAD`。
-5. 如果评估结果是 `GOOD`，直接返回小模型答案，并记录成功反馈。
-6. 如果评估结果是 `BAD`，`EscalationManager` 会把原问题、小模型草稿和错误原因一起交给大模型修复。
-7. 最后把失败案例写入 `data/failure_memory.json`，同时记录这次路由是否正确。
-
-## 目录结构
-
-```text
-sekleton/
-├── main.py
-├── demo_layer3.py
-├── test_semantic_routing.py
-├── runtime/
-│   ├── runtime.py
-│   ├── router.py
-│   ├── semantic_router.py
-│   ├── evaluator.py
-│   ├── escalation.py
-│   ├── memory.py
-│   └── trace.py
-├── models/
-│   ├── model_manager.py
-│   ├── small_model.py
-│   └── large_model.py
-├── prompts/
-│   └── judge_prompt.py
-├── data/
-│   └── failure_memory.json
-└── README.md
-```
-
-## 模块逐个说明
-
-### `main.py`
-
-这是命令行入口。
-
-它做的事情很直接：
-
-- 解析 `--query` 参数。
-- 如果传了单次查询，就调用 `run_once()` 执行一次完整推理，并打印最终答案和元信息。
-- 如果没有传查询，就进入交互模式，持续接收用户输入，直到输入 `exit` 或 `quit`。
-- 每次执行都会创建一个 `AdaptiveInferenceRuntime` 实例，真正的路由、评估和升级逻辑都在运行时对象里完成。
-
-核心函数说明：
-
-- `run_once(query)`：单次运行模式，适合命令行测试。
-- `interactive_mode()`：循环交互模式，适合连续试验。
-- `main()`：解析参数并选择运行模式。
-
-### `runtime/runtime.py`
-
-这是整个系统的总调度器，也是最重要的编排层。
-
-`AdaptiveInferenceRuntime` 把路由、模型调用、质量评估、升级和记忆写入全部串起来，负责把各模块组合成一个可运行的闭环。
-
-它的执行阶段可以理解为：
-
-- `ROUTER`：决定先用哪个模型。
-- `EXECUTION`：调用模型生成答案。
-- `EVALUATOR`：检查小模型答案质量。
-- `ESCALATION`：必要时把任务升级给大模型。
-- `MEMORY`：记录失败和反馈。
-
-主要逻辑：
-
-- 初始化 `Trace`、`FailureMemory`、`ModelManager`、`Router`、`Evaluator` 和 `EscalationManager`。
-- `run(query)` 是主入口，返回一个包含 `answer` 和 `meta` 的字典。
-- 如果路由结果是 `large`，系统直接返回大模型答案。
-- 如果先走 `small`，则经过 `Evaluator` 判定后决定是直接返回还是升级。
-- 在每条路径上都会写入路由反馈，便于后续统计准确率。
-
-返回值中的 `meta` 主要用于观察路径和状态，例如：
-
-- `path`：本次请求走过的处理链路。
-- `escalated`：是否发生了升级。
-- `quality`：小模型答案是否通过评估。
-- `task_type`：路由器识别出的任务类型。
-- `failure_saved`：失败案例是否落盘。
-- `routing_accuracy`：当前历史路由准确率。
-
-### `runtime/router.py`
-
-这是路由决策层，决定一个查询先交给小模型还是大模型。
-
-它不是只看关键词，而是把多个因子加权后再下决定：
-
-- 任务类型失败率：当前任务类型过去是否容易失败。
-- 全局失败率：历史整体是否偏向失败。
-- 语义复杂度：由 `SemanticRouter` 计算的连续分数。
-- 长度和结构复杂度：问题是否过长、是否包含复杂标记词。
-
-关键常量：
-
-- `TASK_TYPE_KEYWORDS`：用于识别任务类型，例如 coding、architecture、optimization、analysis、workflow。
-- `COMPLEXITY_MARKERS`：用于快速判断查询是否带有复杂意图。
-
-主要方法：
-
-- `route(query, memory_stats=None)`：输出路由结果，包含目标模型、原因、语义分数和决策分数。
-- `extract_task_type(query)`：从文本中提取任务类型。
-- `get_failure_rate(task_type)`：根据历史失败案例估算某类任务的失败率。
-
-路由规则可以概括为：
-
-- `decision_score >= 0.55` 时路由到 `large`。
-- 否则路由到 `small`。
-
-这意味着系统默认偏向成本更低的小模型，但会在高风险任务上提前升级。
-
-### `runtime/semantic_router.py`
-
-这是语义复杂度预测器，负责把文本查询映射成一个 0 到 1 之间的复杂度分数。
-
-它的实现方式很轻量，不依赖向量数据库或外部嵌入模型，而是直接用本地文本特征和余弦相似度做近似判断。
-
-核心思路：
-
-- 准备两组种子句子，一组代表简单任务，一组代表复杂任务。
-- 把查询和种子句子都转换成词频向量。
-- 计算查询与简单种子、复杂种子的平均相似度。
-- 根据“复杂相似度减去简单相似度”得到最终复杂度分数。
-
-主要方法：
-
-- `predict_complexity(query)`：返回复杂度分数，越高越偏复杂任务。
-- `add_easy_seed(text)`：动态增加简单种子。
-- `add_hard_seed(text)`：动态增加复杂种子。
-- `debug_similarity(query)`：输出和种子的相似度分布，便于调试路由判断。
-
-这个模块的价值在于：即使没有训练好的向量模型，也能做一个“比关键词更像语义判断”的轻量路由信号。
-
-### `runtime/evaluator.py`
-
-这是答案质量评估器，用于判断小模型的输出是否可以直接返回。
-
-它的判定是分层的，不是只靠一次 LLM 打分：
-
-1. 先检查模型输出里是否带有明显的不自信标记，例如 `[UNCERTAIN_MODEL_OUTPUT]`。
-2. 再检查答案是否过短或空白。
-3. 最后把查询和回答交给判官模型做 `GOOD` / `BAD` 判断。
-
-主要方法：
-
-- `evaluate(query, response)`：返回 `GOOD` 或 `BAD`。
-- `_has_model_uncertainty_marker(response)`：识别模型自己暴露的不确定信号。
-- `_is_too_short_or_empty(response)`：检查回答是否太短或为空。
-- `_normalize_label(judge_output, response)`：把判官输出归一化成标准标签。
-
-判官提示词内置在类变量 `JUDGE_PROMPT_TEMPLATE` 中，要求模型只输出 `GOOD` 或 `BAD`。
-
-这套设计的核心目的是：让系统尽量在低成本阶段就识别出低质量答案，减少无谓的升级和错误传播。
-
-### `runtime/escalation.py`
-
-这是升级管理器，负责把失败的小模型回答交给大模型修复。
-
-它不会简单地把原查询再发一遍，而是会把“为什么失败”一起带给大模型，帮助大模型做定向修复。
-
-主要方法：
-
-- `retry_with_large_model(query, small_answer, reasons)`：构造修复上下文，调用大模型生成改进版答案。
-
-它会拼出一个修复提示，包含：
-
-- 原始用户问题。
-- 小模型的弱草稿。
-- 评估器给出的质量问题原因列表。
-
-这样做的好处是，大模型不是从零开始回答，而是针对“草稿中的缺陷”补全、修正和增强。
-
-### `runtime/memory.py`
-
-这是本地失败记忆和路由反馈存储层，所有历史数据都落在 `data/failure_memory.json`。
-
-它的职责有两类：
-
-- 记录失败案例，保存问题、小模型草稿、最终答案和失败原因。
-- 记录路由反馈，统计路由到底是不是“选对了模型”。
-
-主要方法：
-
-- `load_memory()`：读取 JSON 文件并补齐缺失字段。
-- `save_failure(...)`：保存一次失败样本。
-- `get_failure_rate(...)`：按任务类型或模型估算失败率。
-- `summarize_memory()`：汇总失败数量、按任务类型分布、按模型分布。
-- `save_routing_feedback(...)`：记录一次路由决策是否正确。
-- `get_routing_stats()`：计算路由准确率、最近趋势和按模型统计。
-
-这里最重要的两个数据集是：
-
-- `failures`：保存“答错了”的样本。
-- `routing_feedback`：保存“路由选得对不对”。
-
-这意味着系统既能记住答案失败，也能记住决策失败。
-
-### `runtime/trace.py`
-
-这是运行日志和可观测性模块。
-
-它的作用不是影响决策，而是把每一步发生了什么打印出来，并保存到内存历史中，方便调试和展示。
-
-主要方法：
-
-- `log(stage, message, meta=None)`：打印带阶段标签、时间戳和 JSON 元数据的日志。
-- `print_runtime_summary()`：把整个运行过程按阶段汇总出来。
-- `clear_history()`：清空历史日志。
-- `get_history()`：获取当前日志历史副本。
-
-日志阶段包括：
-
-- `ROUTER`
-- `EXECUTION`
-- `EVALUATOR`
-- `ESCALATION`
-- `MEMORY`
-- `RUNTIME`
-
-这让系统在演示时非常容易看懂每一步的决策链。
-
-### `models/model_manager.py`
-
-这是模型总管理器，统一封装小模型和大模型的调用入口。
-
-它做了两件事：
-
-- 初始化 `SmallModel` 和 `LargeModel`。
-- 根据 `model_name` 分发到对应模型的 `generate()` 方法。
-
-主要方法：
-
-- `generate(model_name, query)`：对外统一调用接口。
-
-如果模型调用失败，它会捕获异常并返回系统错误字符串，避免整个运行时直接崩掉。
-
-### `models/small_model.py`
-
-这是小模型封装，支持两种模式：
-
-- 如果本地 Ollama 可用，就调用真实模型。
-- 如果不可用，就退回到 Mock 逻辑。
-
-它的重点不是“尽可能聪明”，而是“尽可能便宜、快、并能识别自己不确定”。
-
-主要机制：
-
-- 启动时先测试 Ollama 服务是否可用。
-- 如果服务可用，调用本地 `http://localhost:11434/api/chat` 接口。
-- 如果模型输出表现出不自信，会在结果前加上 `[UNCERTAIN_MODEL_OUTPUT]` 标记。
-- 如果长问题的回答过短，会在结果前加上 `[SHORT_RESPONSE]` 标记。
-- 如果 Ollama 不可用，则进入 Mock 生成逻辑，用关键词和长度规则模拟一个低成本模型。
-
-主要方法：
-
-- `generate(query)`：统一入口。
-- `_test_connection()`：检测 Ollama 服务是否在线。
-- `_call_ollama(query, temperature, max_tokens)`：发送原生 HTTP 请求。
-- `_generate_with_ollama(query)`：真实推理路径。
-- `_generate_with_mock(query)`：离线降级路径。
-- `_detect_uncertainty(response)`：检查回答里有没有不自信表述。
-- `_generate_low_confidence_response(reason)`：返回低置信度草稿。
-- `_generate_high_confidence_response()`：返回一个更像“简单任务成功回答”的固定文本。
-
-当前 `ModelManager` 初始化时把 `fallback_to_mock` 设为 `False`，但由于小模型在连接失败时会自动转入本地 Mock 路径，所以项目仍然能在没有 Ollama 的情况下跑起来，只是结果会更像演示文本。
-
-### `models/large_model.py`
-
-这是大模型封装，负责在需要升级时生成更高质量的答案。
-
-它同样通过本地 Ollama 的 HTTP 接口调用模型，但会根据输入内容区分两类场景：
-
-- 常规高难度请求：直接作为技术问答处理。
-- 修复请求：当小模型失败后，带着弱草稿和质量问题一起修复。
-
-主要方法：
-
-- `generate(query)`：判断是常规请求还是修复请求。
-- `_handle_regular(query)`：处理普通高难度问题。
-- `_handle_repair(repair_context)`：处理升级修复请求。
-- `_call_ollama(messages, temperature)`：发送本地模型请求。
-
-它和小模型的区别是：
-
-- 系统更偏向用它做最终修复。
-- 提示词更强调“结构化、具体、完整”。
-- 在修复模式下会显式要求解决弱草稿的问题，不要道歉，只输出改进后的答案。
-
-如果本地 Ollama 不可用，大模型路径会返回系统错误信息，因此如果你希望完整体验升级链路，最好启动本地 Ollama 服务。
-
-### `prompts/judge_prompt.py`
-
-这是一个独立的判官提示词常量。
-
-虽然 `Evaluator` 里也有自己的完整模板，但这个文件保留了一个更简洁的质量判断提示，用于表达“质量评估只输出 GOOD 或 BAD”这一意图。
-
-主要内容：
-
-- 要求判官按相关性、完整性、自信度、可执行价值来分类。
-- 明确限制输出只能是 `GOOD` 或 `BAD`。
-
-### `data/failure_memory.json`
-
-这是本地持久化数据文件。
-
-它保存两类信息：
-
-- `failures`：失败样本，包括问题预览、任务类型、选择了哪个模型、失败原因、小模型草稿和最终答案。
-- `routing_feedback`：路由反馈，包括预测复杂度、选择模型、最终质量、是否选对。
-
-此外还有 `metadata`，用于记录数据版本。
-
-这个文件的存在让系统具备“越跑越有历史”的能力，也让你可以在离线环境下分析路由行为。
-
-### `demo_layer3.py`
-
-这是演示脚本，用来展示 Layer 3 的完整路由与学习能力。
-
-它主要做四件事：
-
-- 演示语义复杂度分析。
-- 演示多因子加权路由。
-- 演示路由反馈记录和统计。
-- 解释整个自学习闭环的架构。
-
-主要函数：
-
-- `demo_semantic_complexity()`：展示简单任务和复杂任务的分数差异。
-- `demo_multifactor_routing()`：展示路由器如何根据多个因子做决定。
-- `demo_routing_feedback()`：模拟写入路由反馈并打印统计结果。
-- `demo_layer3_learning()`：输出 Layer 3 学习系统的架构说明。
-
-如果你想快速理解这个项目如何“越用越聪明”，先跑这个脚本最合适。
-
-### `test_semantic_routing.py`
-
-这是集成测试脚本，用来验证语义路由和反馈记录是否正常工作。
-
-它的验证重点是：
-
-- 简单和复杂问题是否会走不同路径。
-- 路由反馈是否成功写入 JSON 文件。
-- 失败记忆和路由统计是否能正常聚合。
-
-主要函数：
-
-- `print_section(title)`：打印测试分段标题。
-- `test_semantic_routing()`：执行完整集成测试。
-
-这个脚本特别适合在你修改路由、记忆或运行时编排后做一次快速回归检查。
-
-### `runtime/__init__.py`、`models/__init__.py`、`prompts/__init__.py`
-
-这三个文件当前都是空的。
-
-它们的作用只是把对应目录标记成 Python 包，方便模块导入，比如：
-
-- `runtime.runtime`
-- `models.model_manager`
-- `prompts.judge_prompt`
-
-## 运行方式
-
-### 1. 单次查询
+1. 推荐先准备本地 Ollama 与模型（可选，但能得到真实推理质量）：
 
 ```bash
-python main.py --query "Design an adaptive runtime for LLM inference"
+ollama pull qwen2.5:0.5b
+ollama pull qwen3.5:9b
+ollama start
 ```
 
-适合快速测试一条输入从路由到返回的完整链路。
-
-### 2. 交互模式
+2. 启动 Agent（完整模式，已集成自适应推理）：
 
 ```bash
-python main.py
+python main.py --mode agent
 ```
 
-进入后可以持续输入问题，输入 `exit` 或 `quit` 退出。
-
-### 3. 演示脚本
+3. 调试/单次推理：
 
 ```bash
-python demo_layer3.py
+python main.py --mode inference --query "Explain adaptive runtime"
+python main.py --mode inference    # 交互式
 ```
 
-这个脚本会展示语义路由、加权决策、反馈记录和学习闭环。
+环境变量（可选）：
 
-### 4. 集成测试
+- `OLLAMA_BASE_URL`：默认 `http://localhost:11434/api/chat`
+- `AGENT_MODEL` / `COMPRESSION_MODEL`：覆盖默认模型 id
+
+## 项目总体架构（高层）
+
+- 入口：`main.py`（支持 `agent` 与 `inference` 两个模式）
+- Agent 层：`agent.py`（多轮循环、工具分派、上下文管理、与 runtime 集成）
+- 推理运行时：`runtime/runtime.py`（AdaptiveInferenceRuntime，负责路由→执行→评估→升级→记忆）
+- 模型封装：`models/`（`small_model.py`、`large_model.py`、`model_manager.py`）
+- 工具与协作：`TodoManager`、`BackgroundManager`、`MessageBus`、`TeammateManager`（在 `agent.py` 中暴露工具）
+- 持久化：`data/failure_memory.json`（失败样本与路由反馈）
+- 帮助与示例：`demo_layer3.py`、`test_semantic_routing.py`、`test_integrated_agent.py`
+
+## 运行流程（逐步详细）
+1. 接收输入
+
+- 用户在 REPL 输入一条查询，或外部系统调用 `run_once(query)`。系统把该查询追加到当前会话的 `messages` 历史中（`role: user`）。
+
+2. 预处理（Agent 层）
+
+- 执行 `microcompact(messages)`：清除临时/重复信息，保持短期上下文精简。
+- 调用 `BG.drain()` 拉取后台任务通知并把它们作为系统消息注入对话。
+- 检查收件箱 `BUS.read_inbox('lead')` 并把未读消息作为系统/assistant 消息注入。
+- 如果存在未完成的 `TODO` 项，Agent 根据策略决定是否在每轮末尾触发提醒。
+
+3. 自适应推理（Runtime 层）
+
+- Agent 调用 `AdaptiveInferenceRuntime.run(query)`（或把其作为工具在对话中显式调用）。运行时内部执行：
+	- Router：调用 `semantic_router.predict_complexity()` + 查询历史失败率 + 长度/关键词特征，计算 `decision_score` 和 `semantic_score`，返回路由决策（`target`）。
+	- Execution：若 `target == 'small'` 调用 `ModelManager.generate('small', query)`；若 `target == 'large'` 则直接调用大模型。
+	- Evaluator：对小模型输出执行 `Evaluator.evaluate(query, small_answer)`，返回 `GOOD` / `BAD`。
+	- Escalation：若评估为 `BAD`，调用 `Escalation.retry_with_large_model(query, small_answer, reasons)`，并把大模型输出作为最终候选。
+	- Memory：把失败样本与路由反馈写入 `data/failure_memory.json`，并更新路由统计。
+
+4. 注入与模型主循环（Agent 层）
+
+- Runtime 返回 `{'answer': str, 'meta': {...}}`（`meta` 含 `path`、`escalated`、`quality`、`routing_score` 等）。Agent 将 `answer` 或 `meta` 以系统消息形式注入 `messages`，并发起下一次模型调用（若需要）。
+
+5. 工具调用执行
+
+- 如果模型内容包含 `tool_use`（例如模型直接返回一段 JSON 指示执行 `read_file`），Agent 会：
+	1) 使用 `extract_json_block()` 从回复中解析工具调用结构：`{'name':'read_file','input':{'path':'data/x.csv'}}`。
+	2) 调用 `TOOL_HANDLERS['read_file'](**input)`，将返回结果作为 `role: tool` 的消息追加到 `messages`。
+	3) 将工具结果再次交给模型（继续对话），模型据此生成后续动作或最终回答。
+
+6. 结束/压缩与记录
+
+- 本轮结束前，Agent 可能触发 `auto_compact(messages)` 将长历史压缩为摘要并把完整 transcript 保存到 `.transcripts/`。
+- 如果发生失败或升级，运行时会把 `failure` 和 `routing_feedback` 写入 `data/failure_memory.json`，便于后续统计与动态调整。
+
+示例演示（完整调用链）
+
+场景：用户请求 "请读取 data/sales.csv，计算 price 列的平均值并保存到 results.txt"。这个请求既包含文件 I/O 又包含计算，可能导致先用小模型尝试，再升级到大模型。
+
+1) 用户输入：
+
+```
+User: 请读取 data/sales.csv，计算 price 列的平均值并保存到 results.txt
+```
+
+2) Router（示例输出）：
+
+```json
+{
+	"semantic_score": 0.32,
+	"decision_score": 0.28,
+	"target": "small",
+	"reasons": ["成本优先","非复杂算法"]
+}
+```
+
+3) Small model 生成（示例回复，含工具调用）：
+
+```json
+{"type":"tool_use","name":"read_file","input":{"path":"data/sales.csv","limit":500}}
+```
+
+Agent 执行 `TOOL_HANDLERS['read_file'](path='data/sales.csv', limit=500)`，返回 CSV 内容（文本），并把该文本作为 `role: tool` 消息追加到 `messages`。
+
+4) Small model 基于文件内容生成草稿回答，但检测到不自信（示例标记）：
+
+```
+[UNCERTAIN_MODEL_OUTPUT] 我读取了文件，但对数据格式有些不确定。我建议先尝试下面的 Python 代码来计算平均值：
+```python
+import csv
+...
+```
+```
+
+5) Evaluator 判定为 `BAD`（因包含 `[UNCERTAIN_MODEL_OUTPUT]`）：
+
+```json
+{"result":"BAD","reasons":["uncertain_marker","short_answer"]}
+```
+
+6) Escalation 发起到大模型：把 `query`、`small_answer` 与 `reasons` 构造成 `repair_context`，调用 `LargeModel.generate(repair_context)`，大模型返回完整、可靠的代码与 `results.txt` 内容。
+
+7) Agent 执行 `TOOL_HANDLERS['write_file'](path='results.txt', content='average: 123.45')`，并把结果记录为工具消息。
+
+8) Runtime 将一次失败样本写入 `data/failure_memory.json`：
+
+```json
+{
+	"timestamp": 1716090000,
+	"task_type": "file_compute",
+	"selected_model": "small",
+	"reason": ["uncertain_marker"],
+	"small_answer": "[UNCERTAIN_MODEL_OUTPUT] ...",
+	"final_answer": "计算并写入 results.txt: average: 123.45"
+}
+```
+
+9) 最终 Agent 返回给用户：成功确认与结果位置，并在 `meta` 中指出本次请求走过的路径：
+
+```json
+{
+	"answer": "已计算并把平均值写入 results.txt（average: 123.45）",
+	"meta": {"path":"router->small->evaluator->escalation->large->tool_write","escalated":true}
+}
+```
+
+说明：上述示例展示了路由优先成本的策略（先用小模型）、小模型自检导致升级、大模型修复输出、工具执行以及失败记忆的写入完整闭环。
+
+## 关键模块说明（文件级别）
+
+- `main.py`：命令行入口，解析 `--mode` 与 `--query`；`agent` 模式启动多轮 REPL；`inference` 模式用于单次或交互性调试 `AdaptiveInferenceRuntime`。
+
+- `agent.py`：实现完整 Agent loop（microcompact、工具分派、TODO 管理、后台任务等），并在每轮中集成 `AdaptiveInferenceRuntime` 的调用。暴露 `TOOL_HANDLERS` 与 `TOOLS` schema，支持文件读写、bash、task、TodoWrite、inference 等。
+
+- `runtime/runtime.py`：`AdaptiveInferenceRuntime`。主入口 `run(query)` 返回 `{'answer': str, 'meta': {...}}`。协调 `router`、`model_manager`、`evaluator`、`escalation`、`memory` 与 `trace`。
+
+- `runtime/router.py`：多因子路由实现，输出目标模型、语义分数与决策分数；阈值化决定 small/large。
+
+- `runtime/semantic_router.py`：轻量语义复杂度预测（TF-like 向量 + 余弦与种子句子比较），返回 0-1 分数。
+
+- `runtime/evaluator.py`：答案质量评估器（自信度标记、长度检查、判官模型 GOOD/BAD）。
+
+- `runtime/escalation.py`：升级修复逻辑，把小模型的弱草稿与失败原因提交给大模型以获得修复答案。
+
+- `runtime/memory.py`：`failure_memory.json` 的读写接口，保存 `failures` 与 `routing_feedback`，并提供统计方法 `get_routing_stats()`。
+
+- `runtime/trace.py`：可观测性与日志记录，按阶段记录事件并支持汇总展示。
+
+- `models/small_model.py`：小模型封装，优先调用本地 Ollama（若可用），否则降级到 Mock；实现自信度检测并在必要时添加标记（例如 `[UNCERTAIN_MODEL_OUTPUT]`）。
+
+- `models/large_model.py`：大模型封装，负责常规高难度请求与修复请求；修复模式下接收 `repair_context` 并返回改进答案。
+
+- `models/model_manager.py`：统一模型调用接口，封装 small/large 的生成逻辑并捕获异常。
+
+- `prompts/judge_prompt.py`：判官提示模板，要求输出 `GOOD` 或 `BAD`。
+
+- `demo_layer3.py`：演示脚本，说明路由、反馈与学习闭环的运行。
+
+- `test_semantic_routing.py`、`test_integrated_agent.py`：用于单元/集成测试，验证路由、反馈与 agent 流的正确性。
+
+## 每个文件详解（详细）
+
+> 下面以文件为单位逐项说明实现细节、重要函数签名、输入/输出格式示例和扩展点。
+
+- `main.py`
+	- 主要函数：
+		- `parse_args()`：处理 `--mode`、`--query`、`--verbose` 等 CLI 参数。
+		- `run_once(query)`：创建 `AdaptiveInferenceRuntime` 并返回运行结果（`{'answer': str, 'meta': {...}}`）。
+		- `interactive_mode()`：REPL，按行读取用户输入并调用 `run_once` 或启动 Agent loop。
+	- 输出/示例：
+		```python
+		result = run_once('How to design an adaptive runtime?')
+		print(result['answer'])
+		print(json.dumps(result['meta'], indent=2))
+		```
+	- 扩展点：可在外部脚本中直接导入 `run_once` 用作批量测试。
+
+- `agent.py`
+	- 关键结构：`Agent` 类、`TOOL_HANDLERS` 字典、`TOOLS` schema 列表、`TodoManager`、`BackgroundManager`。 
+	- 主要流程（伪码）：
+		```text
+		while True:
+			microcompact(messages)
+			runtime_result = AdaptiveInferenceRuntime.run(query)
+			messages.append({'role':'system','content': runtime_result['answer']})
+			resp = call_model(messages)
+			if resp包含 tool_use:
+				 for tool_call in resp.tool_calls:
+						 out = TOOL_HANDLERS[tool_call['name']](**tool_call['input'])
+						 messages.append({'role':'tool','content': out})
+			else:
+				 messages.append({'role':'assistant','content': resp_text})
+		```
+	- 工具接口约定：每个 handler 接受关键字参数并返回字符串（或可 JSON 序列化的对象），例如：
+		```python
+		def read_file(path: str, limit: int=None) -> str: ...
+		TOOL_HANDLERS['read_file'] = lambda **kw: read_file(kw['path'], kw.get('limit'))
+		```
+	- 注意：Models 的 `tool_use` 输出需保持稳定的 JSON 格式；Agent 有辅助函数 `extract_json_block(text)` 用于从模型回复中提取工具调用参数。
+
+- `runtime/runtime.py`（`AdaptiveInferenceRuntime`）
+	- 主要方法：
+		- `run(query: str) -> dict`：主入口，返回 `{'answer': str, 'meta': {path, escalated, quality, routing_accuracy, ...}}`。
+		- 内部使用 `Router.route(query)` 返回 `{'target': 'small'|'large', 'score': float, 'reason': str}`。
+	- 路由到小模型时会走 `Evaluator.evaluate(query, small_answer)`，返回 `GOOD`/`BAD`；若 `BAD` 则调用 `Escalation.retry_with_large_model(...)`。
+	- `meta` 示例：
+		```json
+		{"path": "router->small->evaluator->escalation->large",
+		 "escalated": true,
+		 "quality": "GOOD",
+		 "routing_accuracy": 0.72}
+		```
+
+- `runtime/router.py`
+	- 输入：`route(query: str, memory_stats: dict=None)`；输出含 `target`, `decision_score`, `semantic_score`, `reasons`。
+	- 可定制权重：语义复杂度、失败率、长度、关键词等权重可在模块顶部配置。
+
+- `runtime/semantic_router.py`
+	- 提供 `predict_complexity(query: str) -> float`（0-1），以及维护 `easy_seeds` / `hard_seeds` 的接口。
+	- 实现细节：TF-like 词频向量、L2 归一化、余弦相似度。
+
+- `runtime/evaluator.py`
+	- `evaluate(query: str, response: str) -> 'GOOD' | 'BAD'`。
+	- 判官调用示例（内部）：
+		```python
+		judge_out = call_judge_model(prompt=JUDGE_PROMPT_TEMPLATE.format(query=query, answer=response))
+		return normalize(judge_out)
+		```
+
+- `runtime/escalation.py`
+	- `retry_with_large_model(query, small_answer, reasons) -> str`：构造修复提示并调用大模型。
+
+- `runtime/memory.py`
+	- 接口：`save_failure(failure_obj)`, `save_routing_feedback(feedback_obj)`, `get_routing_stats()`。
+	- `failure_obj` 示例：
+		```json
+		{"timestamp":123, "task_type":"coding", "selected_model":"small",
+		 "reason":["judge_bad"], "small_answer":"...", "final_answer":"..."}
+		```
+
+- `models/small_model.py` / `models/large_model.py`
+	- 共有方法：`generate(query: str, **opts) -> str`。
+	- Ollama 请求样例（HTTP body）：
+		```json
+		{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"..."}],"temperature":0.2}
+		```
+	- 返回解析：解析 `choices` / `content` 字段，将文本返回；若包含结构化 `tool_use` 则保留原文以供 `Agent` 解析。
+
+- `models/model_manager.py`
+	- `generate(model_name: str, query: str) -> str`，内部调用对应模型实例并捕获异常。
+	- 可扩展：增加 `ModelBackend` 抽象并在此注册。
+
+- `prompts/judge_prompt.py`
+	- 提供 `JUDGE_PROMPT_TEMPLATE` 字符串，要求判官输出 `GOOD` 或 `BAD`（便于 `Evaluator` 自动解析）。
+
+## 调试与常见问题（快速诊断）
+
+- 检查 Ollama 是否运行：
+
+```bash
+curl -sS $OLLAMA_BASE_URL || echo "Ollama not reachable"
+```
+
+- 检查本地模型是否拉取：
+
+```bash
+ollama ls  # 列出已安装模型
+```
+
+- 运行集成测试查看模块健康：
+
+```bash
+python test_integrated_agent.py
+```
+
+- 如果 `WinError 10061`，说明本地 Ollama 未运行或端口被占用；启动 Ollama 或调整 `OLLAMA_BASE_URL`。
+
+## 扩展指南（快速）
+
+- 添加新工具：在 `agent.py` 中实现处理函数并注册到 `TOOL_HANDLERS`，同时在 `TOOLS` 中添加 schema。
+
+- 添加新模型后端：实现 `ModelBackend`（提供 `generate(query)`）并在 `model_manager.py` 中注册映射（`'mybackend' -> MyBackend()`）。
+
+- 支持其他后端（Anthropic/OpenAI）：在 `models/` 下新增适配器模块并在 `model_manager` 中按配置选择后端。
+
+## 数据与持久化
+
+## 数据与持久化
+
+- `data/failure_memory.json`：包含 `failures`（失败样本）和 `routing_feedback`（路由反馈）以及 `metadata`。用于统计与后续策略调整。
+
+## 日志与可观测性
+
+- `trace` 输出示例（在控制台或日志文件）：
+
+```
+[RUNTIME] ... received query
+[ROUTER] ... selected_model=small
+[EVALUATOR] ... BAD
+[ESCALATION] ... escalating to large
+[MEMORY] ... failure saved
+```
+
+这些信息帮助理解每条请求为何走某条路径。
+
+## 如何在没有 Ollama 时运行（降级策略）
+
+- `SmallModel` 支持自动降级到 mock 模式（关键词+模板），以便在没有本地模型时仍能演示和测试。
+- `LargeModel` 在没有 Ollama 时会返回错误信息，因此建议在需要完整升级链路时启动 Ollama。
+
+## 测试命令
 
 ```bash
 python test_semantic_routing.py
+python test_integrated_agent.py
+python demo_layer3.py
 ```
 
-用于验证路由、升级和统计是否正常。
+## 与 `learn-claude-code/agents/s_full.py` 的对比（简明）
 
-## 运行时输出示例
+相同点：
+- 都实现了完整 agent loop（预处理、LLM 调用、工具分派、子 agent 支持、Todo 管理、上下文压缩）。
+- 都提供工具集合（文件 I/O、bash、task、TodoWrite 等）。
+- 都保存对话 transcript 并支持自动压缩与长期历史。
 
-```text
-[RUNTIME] 10:31:02.123 | received query | {"query": "Design adaptive runtime..."}
-[ROUTER] 10:31:02.124 | selected_model=small | {"task_type": "architecture", "decision_score": 0.432, "semantic_score": 0.365}
-[EXECUTION] 10:31:02.501 | invoking model=small | {"route_reason": "default_cost_first"}
-[EVALUATOR] 10:31:03.020 | BAD
-[ESCALATION] 10:31:03.021 | escalating to large model with repair context | {"query_len": 48, "reasons": ["judge_bad"]}
-[MEMORY] 10:31:03.812 | failure case saved | {"task_type": "architecture", "reason": ["judge_bad"]}
-```
+关键差异：
+- LLM 接口：`s_full.py` 以 Anthropic 客户端为中心，直接把 `TOOLS` schema 交给模型，由模型发起 `tool_use` 事件流；本仓库优先使用本地 Ollama HTTP 接口並在 agent 端显式解析模型输出與触发工具处理（更显式的 handler 控制）。
+- 推理分层：本项目把路由/评估/升级抽象为独立的 `AdaptiveInferenceRuntime`（模块化、可复用），`s_full.py` 更倾向把控制流嵌入主循环並依赖模型 prompt 控制策略。
+- 多模型策略：本项目明确区分压缩模型与主模型（`COMPRESSION_MODEL` / `AGENT_MODEL`），在 runtime 层做分层路由；`s_full.py` 通常以单一 MODEL 常量为主并通过提示词管理行为。
+- 错误与降级：本仓库实现了 SmallModel 的自动降级 mock 路径與 FailureMemory 的统计回路；`s_full.py` 示例更多演示同步工具流與团队协作功能。
+- 可测试性：保留独立的 `inference` 入口用于调试 `AdaptiveInferenceRuntime`，便于在不启动完整 agent loop 的情况下测试路由与升级逻辑。
 
-这些日志来自 `Trace`，可以帮助你看清每一步为什么这么走。
+建议：若你需要与 `s_full.py` 更高保真地兼容，可考虑在 `agent` 中添加对 Anthropic SDK 的适配层（Adapter），或让 `AdaptiveInferenceRuntime` 支持多后端（Ollama/Anthropic/OpenAI）。
 
-## 数据结构说明
+---
 
-### `failures` 样本
+已把项目的详细说明合并到本 `README.md` 中；如果你希望我把这份文档拆成 `AGENT_GUIDE.md`（更长）並把 README 保留为简短入口，我也可以按你的偏好拆分並生成目录索引。
 
-`save_failure()` 会写入如下字段：
-
-- `timestamp`：时间戳。
-- `task_type`：任务类型。
-- `selected_model`：当时选中的模型。
-- `query_preview`：查询预览。
-- `reason`：失败原因列表。
-- `small_answer`：小模型草稿，若有。
-- `final_answer`：最终答案，若有。
-
-### `routing_feedback` 样本
-
-`save_routing_feedback()` 会写入如下字段：
-
-- `timestamp`：时间戳。
-- `query_preview`：查询预览。
-- `predicted_complexity`：路由器预测复杂度。
-- `selected_model`：最终选中的模型。
-- `final_quality`：`GOOD` 或 `BAD`。
-- `was_correct`：这次路由是否正确。
-
-## 设计特点
-
-- 轻量：只依赖 Python 标准库。
-- 本地：数据全部落到本地 JSON 文件。
-- 可观测：每个阶段都有 trace 日志。
-- 可学习：失败样本和路由反馈都会累积。
-- 可替换：如果以后要接入真实 API 或更强的模型，只需要替换 `models/` 里的实现。
-
-## 当前限制
-
-- 小模型和大模型都默认走本地 Ollama 接口，需要本机服务可用才能体验真实推理。
-- 如果没有 Ollama，大模型路径会返回系统错误字符串。
-- 语义路由仍是轻量近似实现，不是训练好的嵌入模型。
-- 当前学习机制是统计和记录型的，还没有自动调阈值的在线优化逻辑。
-
-## 后续可扩展方向
-
-- 给路由器增加动态阈值调整。
-- 根据历史失败样本自动更新复杂种子。
-- 为大模型修复阶段加入更细粒度的错误分类。
-- 把本地 JSON 存储替换成更稳健的数据库或向量存储。
-
-## 一句话总结
-
-这个项目实现了一个最小但完整的自适应推理闭环：先路由、再生成、再评估、必要时升级、最后把经验写回记忆，形成一个可以持续迭代的本地智能体运行时。

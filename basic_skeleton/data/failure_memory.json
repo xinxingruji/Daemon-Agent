@@ -135,6 +135,22 @@
       "selected_model": "small",
       "final_quality": "GOOD",
       "was_correct": true
+    },
+    {
+      "timestamp": 1779242784,
+      "query_preview": "What is 2+2?",
+      "predicted_complexity": 0.409,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
+    },
+    {
+      "timestamp": 1779242923,
+      "query_preview": "What is 2+2?",
+      "predicted_complexity": 0.409,
+      "selected_model": "small",
+      "final_quality": "GOOD",
+      "was_correct": true
     }
   ]
 }
