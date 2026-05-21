@@ -77,7 +77,7 @@ pip install -r requirements.txt
 ollama serve
 
 # 拉取 nomic-embed-text 模型
-ollama run nomic-embed-text
+ollama run nomic-embed-text-v2-moe
 
 ```
 
