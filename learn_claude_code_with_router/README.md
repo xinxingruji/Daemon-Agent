@@ -59,7 +59,7 @@ model_list:
 > [!NOTE]
 > **注意 3：** 本地小模型实测过于鸡肋了，可以配置 `small` 为便宜的云端模型，`large` 为贵的云端模型。
 > 
-> **注意 4：** 注意如果云端模型时 deepseek，`model:` 那里要写 `deepseek/deepseek-chat`（非思考）或者 `deepseek/deepseek-reasoner`（思考版）。
+> **注意 4：** 注意如果云端模型时 deepseek，`model:` 那里要写 `deepseek/deepseek-chat`（非思考）或者 `deepseek/deepseek-reasoner`（思考版）。具体详见: >https://github.com/BerriAI/litellm#supported-providers-website-supported-models--docs
 > 
 > **注意 5：** 如果 `small` 决定用本地小模型，注意在 `small` 部分的 `litellm_params` 下面加一个：
 > ```yaml
