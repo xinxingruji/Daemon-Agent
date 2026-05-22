@@ -229,7 +229,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms_full >> \033[0m")
+            query = input("\033[36mDaemon >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
