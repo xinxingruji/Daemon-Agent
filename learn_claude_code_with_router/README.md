@@ -1,4 +1,3 @@
-```markdown
 # 🚀 如何运行 (Usage)
 
 本系统依赖 **Ollama**（提供本地向量嵌入）和 **LiteLLM Proxy**（统一大小模型 API 调用网关）来运行。
