@@ -53,11 +53,14 @@ model_list:
 
 > [!IMPORTANT]
 > **注意 1：** 这份 `litellm_config.yaml` 中绝对不能出现中文，连注释也不可以。
+> 
 > **注意 2：** 云端的 `api_key` 一定要写在这里，写在 `.env` 中没用，因为 litellm 不会去 `.env` 中读取。
 
 > [!NOTE]
 > **注意 3：** 本地小模型实测过于鸡肋了，可以配置 `small` 为便宜的云端模型，`large` 为贵的云端模型。
+> 
 > **注意 4：** 注意如果云端模型时 deepseek，`model:` 那里要写 `deepseek/deepseek-chat`（非思考）或者 `deepseek/deepseek-reasoner`（思考版）。
+> 
 > **注意 5：** 如果 `small` 决定用本地小模型，注意在 `small` 部分的 `litellm_params` 下面加一个：
 > ```yaml
 > extra_body:
