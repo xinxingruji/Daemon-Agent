@@ -206,8 +206,8 @@ def agent_loop(messages: list, query: str):
 
                 # 记录错题本
                 if is_tool_error(output) and current_model == "small":
-                    mistake_context = f"{routing_query} (Failed at: {block.name})"
-                    ROUTER.record_mistake(mistake_context)
+                    # mistake_context = f"{routing_query} (Failed at: {block.name})"
+                    ROUTER.record_mistake(routing_query)
 
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
