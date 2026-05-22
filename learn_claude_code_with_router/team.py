@@ -66,8 +66,8 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
                 # 错题本机制
                 output = h(**b.input)
                 if is_tool_error(output) and current_model == "small":
-                    mistake_context = f"{prompt} (Failed at: {b.name})"
-                    ROUTER.record_mistake(mistake_context)
+                    # mistake_context = f"{prompt} (Failed at: {b.name})"
+                    ROUTER.record_mistake(prompt)
 
                 results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(output)[:50000]})
         sub_msgs.append({"role": "user", "content": results})
@@ -200,8 +200,8 @@ class TeammateManager:
 
                         # 错题本机制
                         if is_tool_error(output) and current_model == "small":
-                            mistake_context = f"{current_mission} (Failed at: {block.name})"
-                            ROUTER.record_mistake(mistake_context)
+                            # mistake_context = f"{current_mission} (Failed at: {block.name})"
+                            ROUTER.record_mistake(current_mission)
                         
                         results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 messages.append({"role": "user", "content": results})
