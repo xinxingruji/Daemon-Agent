@@ -1,0 +1,12 @@
+model_list:
+  # 你的小模型：映射到本地的 Ollama
+  - model_name: small
+    litellm_params:
+      model: ollama/qwen3.5:9b
+      api_base: http://localhost:11434
+
+  # 你的大模型：映射到便宜又强大的云端 DeepSeek V3 (或者任何你喜欢的模型)
+  - model_name: large
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/ANTHROPIC_API_KEY
