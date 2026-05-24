@@ -1,0 +1,17 @@
+model_list:
+  # --- local small model ---
+  # - model_name: small
+  #   litellm_params:
+  #     model: ollama/qwen2.5:1.5b
+  #     api_base: http://localhost:11434
+  #     extra_body:
+  #       think: false
+  # --- cloud models ---
+  - model_name: small
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: your-api-key
+  - model_name: large
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: your-api-key
