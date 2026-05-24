@@ -3,9 +3,10 @@ import math
 import os
 import urllib.request
 from typing import List, Dict
+from utterances import SMALL, LARGE
 
 class Claude_Router:
-    def __init__(self, threshold: float = 0.75, mistake_threshold: float = 0.85, mistake_file: str = "mistakes.json", safe_tokens: int = 3000, penalty_step: int = 4000, max_mistakes: int = 200):
+    def __init__(self, threshold: float = 0.45, mistake_threshold: float = 0.85, mistake_file: str = "mistakes.json", safe_tokens: int = 3000, penalty_step: int = 4000, max_mistakes: int = 200):
         self.threshold = threshold
         self.mistake_threshold = mistake_threshold # 错题拦截的相似度要求更严苛一点
         self.mistake_file = mistake_file
@@ -21,11 +22,8 @@ class Claude_Router:
         
         print(f"[Router] 初始化零依赖向量大脑...")
         
-        # 1. 正常的路由航线
-        self.routes = {
-            "small": ["列出当前目录的文件", "读取内容", "看看有什么", "当前时间", "确认状态"],
-            "large": ["重构代码", "微服务架构", "分析优缺点", "找出内存泄漏点"]
-        }
+        # 1. 正常的路由航线（种子语句在 utterances.py 中维护）
+        self.routes = {"small": SMALL, "large": LARGE}
 
         # 2. 加载错题本记录
         self.mistake_book = self._load_mistakes()
@@ -34,11 +32,18 @@ class Claude_Router:
 
         # 3. 预计算常规种子向量
         self.route_embeddings = {"small": [], "large": []}
+        total = sum(len(v) for v in self.routes.values())
+        done = 0
         for route_name, utterances in self.routes.items():
             for text in utterances:
                 vec = self._get_embedding(text)
                 if vec:
                     self.route_embeddings[route_name].append(vec)
+                done += 1
+                pct = done * 100 // total
+                bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                print(f"\r\033[K  [Router] 加载向量: |{bar}| {pct}% ({done}/{total})", end="", flush=True)
+        print()
 
     def _load_mistakes(self) -> List[Dict]:
         """从本地 JSONL 文件逐行加载错题本"""

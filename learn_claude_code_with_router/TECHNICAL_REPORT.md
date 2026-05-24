@@ -28,24 +28,24 @@
 **创新**
 
 - 微观/宏观双轨路由器 `Claude_Router`（[router.py](router.py)）
-	- 目的：在运行时根据语义匹配、历史失败与上下文规模自动选择 `small` 或 `large` 模型，最大化使用低成本小模型同时在风险场景保证正确性。
-	- 实现要点：预计算路由种子向量并缓存（`route_embeddings`）、对查询做在线向量化匹配、结合 `mistake_book` 与动态 token 惩罚计算最终决策；当嵌入不可用或 `force_large` 为真时保守回退为 `large`。
-	- 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险，适合工程化部署场景。
+    - 目的：在运行时根据语义匹配、历史失败与上下文规模自动选择 `small` 或 `large` 模型，最大化使用低成本小模型同时在风险场景保证正确性。
+    - 实现要点：预计算路由种子向量并缓存（`route_embeddings`）、对查询做在线向量化匹配、结合 `mistake_book` 与动态 token 惩罚计算最终决策；当嵌入不可用或 `force_large` 为真时保守回退为 `large`。
+    - 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险，适合工程化部署场景。
 
 - 错题本（mistake book）（[router.py](router.py) 的 `record_mistake` 与 `_load_mistakes`）
-	- 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
-	- 实现要点：在小模型触发 `is_tool_error` 时获取查询向量并追加写入 JSONL（超限时覆盖重写），路由阶段线性扫描并用余弦相似度短路到 `large`。
-	- 意义：提高系统可靠性与任务成功率，减少由于重复错误导致的人工干预与系统回滚成本；使得升级模型的触发更具针对性而非盲目升阶。
+    - 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
+    - 实现要点：在小模型触发 `is_tool_error` 时获取查询向量并追加写入 JSONL（超限时覆盖重写），路由阶段线性扫描并用余弦相似度短路到 `large`。
+    - 意义：提高系统可靠性与任务成功率，减少由于重复错误导致的人工干预与系统回滚成本；使得升级模型的触发更具针对性而非盲目升阶。
 
 - 动态 Token 惩罚与长期上下文衰减（[router.py](router.py) 参数与逻辑）
-	- 目的：当对话/上下文变长时，适当提高小模型被判定为可行的相似度阈值，避免在长上下文中误判小模型能胜任复杂推理或状态管理任务。
-	- 实现要点：根据 `total_tokens`、`safe_tokens`、`penalty_step` 与 `penalty_rate` 计算 `dynamic_threshold`，并在 `best_route=='small'` 时用其替代静态阈值以决定是否仍选小模型。
-	- 意义：在成本与正确性之间建立可控权衡；减少因历史上下文累积导致的小模型错误，提升系统在长期会话/任务中的稳定性。
+    - 目的：当对话/上下文变长时，适当提高小模型被判定为可行的相似度阈值，避免在长上下文中误判小模型能胜任复杂推理或状态管理任务。
+    - 实现要点：根据 `total_tokens`、`safe_tokens`、`penalty_step` 与 `penalty_rate` 计算 `dynamic_threshold`，并在 `best_route=='small'` 时用其替代静态阈值以决定是否仍选小模型。
+    - 意义：在成本与正确性之间建立可控权衡；减少因历史上下文累积导致的小模型错误，提升系统在长期会话/任务中的稳定性。
 
 - 工程化的模型映射与可配置调度（[config.py](config.py), [litellm_config.yaml](litellm_config.yaml)）
-	- 目的：把模型选择与底层提供者（LiteLLM/Anthropic/本地代理）解耦，使小/大模型映射可通过配置调整而无需改动路由器代码。
-	- 实现要点：通过 [config.py](config.py) 与 [litellm_config.yaml](litellm_config.yaml) 的映射关系，[main.py](main.py) / [team.py](team.py) 在调用时以 `ROUTER` 的决策结果选择对应模型名称并传递给客户端调用层。
-	- 意义：便于在不同部署环境下切换模型、快速做 A/B 或成本策略调整，提高系统的可运维性与可迁移性。
+    - 目的：把模型选择与底层提供者（LiteLLM/Anthropic/本地代理）解耦，使小/大模型映射可通过配置调整而无需改动路由器代码。
+    - 实现要点：通过 [config.py](config.py) 与 [litellm_config.yaml](litellm_config.yaml) 的映射关系，[main.py](main.py) / [team.py](team.py) 在调用时以 `ROUTER` 的决策结果选择对应模型名称并传递给客户端调用层。
+    - 意义：便于在不同部署环境下切换模型、快速做 A/B 或成本策略调整，提高系统的可运维性与可迁移性。
 
 
 
@@ -242,22 +242,148 @@ python main.py
 - 新增自定义插件：工具系统采用 `TOOLS` + `TOOL_HANDLERS` 的注册模式，新增工具只需补充 schema 和处理函数，不需要重写主循环。
 - 多智能体协同：`team.py` 已经把短生命周期子智能体和长期驻留队友拆开，消息总线、任务管理器和后台任务管理器也都是独立模块，因此后续可以继续扩展专用角色、并行分工和任务接力机制。
 
+### 8.3 性能基准测试
+
+[benchmark.py](benchmark.py) 提供本地和 API 两种基准测试模式。详细测试数据见第 11 节。
+
+> **关于路由初始化耗时**：benchmark 本地模式通过 mock 拦截了 `_get_embedding` 调用（直接返回固定向量，不实际访问 Ollama），因此初始化耗时仅 742 µs。生产环境中路由器在启动时需逐条调用 Ollama 的 `/api/embeddings` 接口（使用 `nomic-embed-text` 模型）对种子语句生成 768 维嵌入向量，实际耗时取决于种子数量和网络速度。此外运行时每次 `route()` 调用也需向 Ollama 请求一次 query 向量嵌入，实测约 4 秒。benchmark 的设计意图是只测量路由逻辑本身的纯计算开销，排除外部服务的波动干扰。
+
 ## 9. 安全性、鲁棒性与限制
 
 - 安全：
-	- `run_bash` 的实现位于 [core_tools.py](core_tools.py)。当命令字符串包含任一危险子串（如 "rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"）时，函数直接返回 `Error: Dangerous command blocked`，不会调用子进程。
-	- 对正常执行的命令，使用 `subprocess.run(..., timeout=120)` 执行；将 `stdout` 与 `stderr` 合并后最多截断为 50000 字符返回；当无输出时返回 `(no output)`。
-	- 对于 `grep`、`diff`、`cmp` 此类探测型工具，若返回码为 1（常表示未找到匹配或存在差异），实现会视为正常探测结果并返回非错误文本而非 `Error:` 前缀输出。
+    - `run_bash` 的实现位于 [core_tools.py](core_tools.py)。当命令字符串包含任一危险子串（如 "rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"）时，函数直接返回 `Error: Dangerous command blocked`，不会调用子进程。
+    - 对正常执行的命令，使用 `subprocess.run(..., timeout=120)` 执行；将 `stdout` 与 `stderr` 合并后最多截断为 50000 字符返回；当无输出时返回 `(no output)`。
+    - 对于 `grep`、`diff`、`cmp` 此类探测型工具，若返回码为 1（常表示未找到匹配或存在差异），实现会视为正常探测结果并返回非错误文本而非 `Error:` 前缀输出。
 
 - 鲁棒性：
-	- 路由器在 [router.py](router.py) 中通过 `_get_embedding` 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时，`_get_embedding` 返回空向量，`route(...)` 在此情况下保守地返回 `large`。
-	- 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数超过 `max_mistakes`（默认 200）时，最早条目会被移除并触发覆盖式重写以持久化删除。
+    - 路由器在 [router.py](router.py) 中通过 `_get_embedding` 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时，`_get_embedding` 返回空向量，`route(...)` 在此情况下保守地返回 `large`。
+    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数超过 `max_mistakes`（默认 200）时，最早条目会被移除并触发覆盖式重写以持久化删除。
 
 - 限制：
-	- 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，未集成专用近似最近邻索引（如 FAISS/annoy）。在错题本或种子向量规模较大时，查询复杂度为 O(n)，可能成为性能瓶颈。
-	- `estimate_tokens(messages)` 使用 `len(json.dumps(messages, default=str)) // 4` 作为简化估算，非基于真实 tokenizer 计数，可能导致触发压缩的阈值与实际 token 使用存在偏差。
+    - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，未集成专用近似最近邻索引（如 FAISS/annoy）。在错题本或种子向量规模较大时，查询复杂度为 O(n)，可能成为性能瓶颈。
+    - `estimate_tokens(messages)` 使用 `len(json.dumps(messages, default=str)) // 4` 作为简化估算，非基于真实 tokenizer 计数，可能导致触发压缩的阈值与实际 token 使用存在偏差。
 
-## 10. 结论
+## 10. 测试
+
+测试采用 `pytest` 框架，所有测试不依赖 Ollama、不调用 API、不写入真实文件，纯逻辑验证。
+
+### 10.1 测试文件结构
+
+- [tests/test_utterances.py](tests/test_utterances.py) — 验证种子数据完整性
+- [tests/test_router.py](tests/test_router.py) — 验证路由核心逻辑
+- [tests/conftest.py](tests/conftest.py) — 提供 mock 工具函数，在初始化阶段拦截 `_get_embedding` 与 `_load_mistakes`，避免触发外部嵌入服务与文件读写
+
+### 10.2 种子数据测试（4 项）
+
+| 测试 | 验证点 |
+|------|--------|
+| `test_small_not_empty` | SMALL 列表不为空 |
+| `test_large_not_empty` | LARGE 列表不为空 |
+| `test_small_no_duplicates` | SMALL 中无重复条目 |
+| `test_large_no_duplicates` | LARGE 中无重复条目 |
+
+### 10.3 路由逻辑测试（11 项）
+
+**余弦相似度（4 项）**
+
+| 测试 | 验证点 |
+|------|--------|
+| `test_identical` | 完全相同向量 → 余弦相似度 1.0 |
+| `test_orthogonal` | 正交向量 → 余弦相似度 0.0 |
+| `test_opposite` | 相反向量 → 余弦相似度 -1.0 |
+| `test_empty` | 空向量参与计算 → 余弦相似度 0.0 |
+
+**路由决策（5 项）**
+
+| 测试 | 验证点 |
+|------|--------|
+| `test_force_large` | `force_large=True` 时任何 query 都返回 `"large"` |
+| `test_empty_query` | 空字符串或纯空白 query 返回 `"large"` |
+| `test_mistake_intercepted` | query 向量与错题本记录相似度超过阈值 → 触发拦截返回 `"large"` |
+| `test_below_threshold_goes_large` | 语义得分低于基础 threshold → 返回 `"large"` |
+| `test_token_penalty_raises_bar` | 上下文膨胀时动态及格线升高，原本可走 small 的任务被升级为 large |
+
+**错题本管理（2 项）**
+
+| 测试 | 验证点 |
+|------|--------|
+| `test_record_mistake_writes_file` | `record_mistake` 将失败的查询写入 JSONL 文件且包含 query 与 vector 字段 |
+| `test_mistake_book_max_limit` | 超过 `max_mistakes` 时淘汰最老条目，保持容量上限 |
+
+### 10.4 运行方式
+
+```bash
+# 使用已安装 pytest 的 Python
+python -m pytest tests/ -v
+```
+
+## 11. 性能基准测试详细数据
+
+以下数据由 [benchmark.py](benchmark.py) 测得，测试环境如下：
+
+| 项目 | 环境 |
+|------|------|
+| 操作系统 | Windows 11, Conda 环境 |
+| 嵌入模型 | Ollama `nomic-embed-text`（768 维） |
+| 小模型 (small) | LiteLLM → `deepseek/deepseek-chat` |
+| 大模型 (large) | LiteLLM → `deepseek/deepseek-reasoner` |
+| 嵌入方式 | 本地模式 mock（不调 Ollama），加 `--api` 时真实调用 |
+
+### 11.1 路由初始化
+
+| 指标 | 耗时 |
+|------|------|
+| 种子向量加载（81 条 mock 嵌入） | 742 µs |
+
+> 注：此数据为 mock 嵌入服务的值。生产环境中实际需调用 Ollama，81 条种子需更多时间。
+
+### 11.2 余弦相似度计算
+
+| 测试项 | 单次计算耗时 |
+|--------|-------------|
+| 余弦 128d (单次) | 13.1 µs |
+| 余弦 256d (单次) | 25.5 µs |
+| 余弦 512d (单次) | 50.4 µs |
+| 余弦 768d (单次) | 78.4 µs |
+| 批量匹配 1×100 (单次) | 1.38 ms |
+
+测试条件：各维度循环 10,000 次取平均值，批量匹配 1,000 次平均。余弦相似度为纯数学运算，不依赖外部服务，耗时随维度线性增长。
+
+### 11.3 路由决策耗时
+
+| 场景 | 单次决策耗时 |
+|------|-------------|
+| 简单（"列出文件"） | 428 µs |
+| 简单（"当前时间"） | 414 µs |
+| 代码（"写一个 Python 函数"） | 411 µs |
+| 架构（"设计微服务架构"） | 412 µs |
+
+测试条件：各场景循环 500 次取平均值（mock 嵌入）。路由决策包含嵌入向量匹配、错题本扫描和动态阈值计算，总耗时约 400 µs 级别。
+
+### 11.4 错题本规模对决策速度的影响
+
+| 错题本条目数 | 单次决策耗时 |
+|-------------|-------------|
+| 0 条 | 414 µs（完整扫描 81 条种子） |
+| 10 条 | 33.6 µs（命中短路，快速返回 large） |
+| 50 条 | 35.9 µs |
+| 100 条 | 38.7 µs |
+
+当错题本中有匹配条目时，路由器提前短路返回 `large`，跳过后续的全量种子扫描，反而比无错题本时更快。
+
+### 11.5 API 调用延迟（含 LiteLLM 代理）
+
+以下数据来自 `python benchmark.py --api` 实测（模型通过 LiteLLM 代理转发，路由决策使用真实 Ollama 嵌入）：
+
+| 测试项 | 耗时 |
+|--------|------|
+| small (deepseek-chat) | 0.875 秒 |
+| large (deepseek-reasoner) | 0.711 秒 |
+| 路由决策开销（含 Ollama 嵌入） | 4.055 秒 → large |
+
+路由决策的 4.055 秒主要消耗在 Ollama 的 `/api/embeddings` 调用上（将 query 转为 768 维向量）；纯算法部分（余弦匹配、错题本扫描、动态阈值）仅约 400 µs。相比 API 模型调用本身（约 1 秒以内），**嵌入服务是路由延迟的主要瓶颈**，而非路由逻辑本身。
+
+## 12. 结论
 
 该框架实现了在工程化场景下平衡成本与可靠性的实践：以轻量向量检索为核心判断依据，辅以错题本与上下文衰减惩罚，能够在多数常规任务中优先选择小模型以节约成本，同时在潜在高风险情形下自动切换到大模型保证正确性。
 

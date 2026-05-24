@@ -51,6 +51,14 @@ model_list:
 
 ```
 
+也可以直接复制模板：
+
+```bash
+cp litellm_config.example.yaml.example litellm_config.yaml
+
+```
+
+
 > [!IMPORTANT]
 > **注意 1：** 这份 `litellm_config.yaml` 中绝对不能出现中文，连注释也不可以。
 > 
@@ -69,7 +77,7 @@ model_list:
 > ```
 > 
 > 
-> 这样可以关闭本地模型的思考模式，本地模型还是不要思考了，思考半天屁都放不出来一个。api_base: http://localhost:11434 貌似可以去掉
+> 这样可以关闭本地模型的思考模式。
 
 配置好后**在一个新终端窗口启动 LiteLLM 代理**：
 
@@ -113,4 +121,80 @@ python main.py
 
 ```
 
+---
+
+## 5. 测试
+
+本项目提供两类测试：正确性测试（pytest，纯逻辑验证）和性能基准测试（benchmark，含本地 + API 两种模式）。
+
+### 5.1 正确性测试（不依赖外部服务）
+
+```bash
+python -m pytest tests/ -v
+```
+
+共包含 28 项测试，所有测试均不依赖 Ollama、不调用 API、不写入真实文件，通过 mock 隔离外部依赖。
+
+**测试内容：**
+
+| 分类 | 文件 | 测试数 | 验证点 |
+|------|------|--------|--------|
+| 种子数据完整性 | [tests/test_utterances.py](tests/test_utterances.py) | 4 | SMALL/LARGE 非空、无重复 |
+| 余弦相似度 | [tests/test_router.py](tests/test_router.py) | 4 | 相同向量 → 1.0、正交 → 0、相反 → -1.0、空向量 → 0 |
+| 路由决策 | [tests/test_router.py](tests/test_router.py) | 5 | force_large 强制升级、空 query 保守兜底、错题本拦截、低于阈值降级、token 惩罚动态升阶 |
+| 错题本管理 | [tests/test_router.py](tests/test_router.py) | 2 | 失败记录写入 JSONL、超出容量时 FIFO 淘汰 |
+| 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟 |
+
+**运行环境要求：**
+- 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）
+- 只需要 Python 环境已安装 `pytest` 和项目依赖
+
+### 5.2 性能基准测试
+
+单独的性能基准脚本 [benchmark.py](benchmark.py)，输出格式化表格并导出 JSON 文件。
+
+#### 5.2.1 仅本地模式（推荐，无需任何外部服务）
+
+```bash
+python benchmark.py
+```
+
+**测试内容：** 路由初始化耗时、128d/256d/512d/768d 余弦相似度计算速度、批量匹配、路由决策延迟（mock 嵌入）、错题本规模影响。
+
+**输出位置：** 项目根目录下生成 `benchmark_results.json`，包含所有测试项的精确数值和单位。
+
+> 本地模式下 embedding 调用被 mock，只测量路由逻辑的纯计算开销，排除 Ollama 网络波动干扰。初始化耗时约 700 µs，路由决策约 400 µs。
+
+#### 5.2.2 含 API 模式（需 LiteLLM 代理在线）
+
+```bash
+python benchmark.py --api
+```
+
+**前置条件：** 必须先启动 LiteLLM 代理（参见第 3 节）。
+
+**额外测试内容：** 在本地测试的基础上，新增：
+- small 模型（deepseek-chat）真实 API 响应时间
+- large 模型（deepseek-reasoner）真实 API 响应时间
+- 路由决策真实开销（含 Ollama 嵌入调用）
+
+**输出位置：** 同样写入 `benchmark_results.json`，包含 API 延迟数据。
+
+> 路由决策耗时在含 API 模式下会显著增加（约 4 秒），因为实际调用了 Ollama 的 `/api/embeddings` 将 query 转为向量。这部分开销来自嵌入服务，而非路由算法本身。
+
+#### 5.2.3 输出文件说明
+
+| 文件 | 由哪个命令生成 | 内容 |
+|------|--------------|------|
+| `benchmark_results.json` | `python benchmark.py [--api]` | 所有测试项的 name/value/unit/detail，JSON 数组格式 |
+| `mistakes.json` | 路由测试写入（测试用后自动清理） | 错题本临时文件 |
+
+`benchmark_results.json` 示例字段：
+
+```json
+[
+  { "name": "路由初始化总耗时", "value": 0.000742, "unit": "秒", "detail": "81 条种子向量" },
+  { "name": "small (deepseek-chat)", "value": 0.875, "unit": "秒", "detail": "" },
+  ...
+]
 ```
