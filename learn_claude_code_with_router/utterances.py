@@ -9,7 +9,7 @@ SMALL = [
     "search", "find",
     "生成", "写注释", "格式化", "写函数", "生成测试",
     "write function", "generate test",
-    "查看", "系统信息",
+    "系统信息",
     "check network", "check ip",
     "你好", "谢谢", "好的", "是的", "不对", "加油", "抱歉",
     "你是谁", "再见",

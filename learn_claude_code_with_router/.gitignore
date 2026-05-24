@@ -23,6 +23,10 @@ dist/
 # Logs
 *.log
 
+# Runtime generated files
+mistakes.json
+benchmark_results.json
+
 # Config files
 litellm_config.yaml
 

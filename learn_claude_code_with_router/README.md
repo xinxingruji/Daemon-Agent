@@ -54,7 +54,7 @@ model_list:
 也可以直接复制模板：
 
 ```bash
-cp litellm_config.example.yaml.example litellm_config.yaml
+cp litellm_config.example.yaml litellm_config.yaml
 
 ```
 
