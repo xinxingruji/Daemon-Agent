@@ -36,17 +36,10 @@ class TestRouteDecision:
     def test_mistake_intercepted(self):
         """触发错题本时应返回 large"""
         vec = [1.0, 1.0, 1.0]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({"query": "失败", "vector": vec}, f)
-            mistake_file = f.name
-
-        try:
-            r = make_router(mistake_file=mistake_file)
-            r.mistake_book = [{"query": "失败", "vector": vec}]
-            with patch.object(r, "_get_embedding", return_value=vec):
-                assert r.route("失败") == "large"
-        finally:
-            os.unlink(mistake_file)
+        r = make_router()
+        r.mistake_book = [{"query": "失败", "vector": vec}]
+        with patch.object(r, "_get_embedding", return_value=vec):
+            assert r.route("失败") == "large"
 
     def test_below_threshold_goes_large(self):
         """得分低于 threshold 应返回 large"""
@@ -55,6 +48,9 @@ class TestRouteDecision:
         r.route_embeddings = {"small": [[1.0, 0.0, 0.0]], "large": []}
         with patch.object(r, "_get_embedding", return_value=[0.0, 1.0, 0.0]):
             assert r.route("无关内容") == "large"
+
+    def test_force_small(self, router):
+        assert router.route("hello", force_small=True) == "small"
 
     def test_token_penalty_raises_bar(self):
         """长上下文提升动态及格线"""
@@ -102,3 +98,64 @@ class TestMistakeRecording:
             assert len(r.mistake_book) == 3
             assert r.mistake_book[0]["query"] == "q2"
             assert r.mistake_book[-1]["query"] == "q4"
+
+
+class TestSeedManagement:
+    def test_add_seed(self):
+        """添加种子后文本和向量同步追加"""
+        r = make_router()
+        initial_small = len(r.route_embeddings["small"])
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
+            r.add_seed("新任务", "small")
+
+        assert len(r.route_embeddings["small"]) == initial_small + 1
+        assert len(r.route_embeddings_text["small"]) == initial_small + 1
+        assert r.route_embeddings_text["small"][-1] == "新任务"
+
+    def test_add_seed_no_duplicate(self):
+        """重复文本不被重复添加"""
+        r = make_router()
+        initial = len(r.route_embeddings["small"])
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
+            r.add_seed("新任务", "small")
+            r.add_seed("新任务", "small")  # 第二次应跳过
+
+        assert len(r.route_embeddings["small"]) == initial + 1
+
+    def test_add_seed_empty_skip(self):
+        """空文本跳过不添加"""
+        r = make_router()
+        initial = len(r.route_embeddings["small"])
+        r.add_seed("   ", "small")
+        assert len(r.route_embeddings["small"]) == initial
+
+    def test_remove_most_similar_seed(self):
+        """删除与查询向量余弦距离最近的种子"""
+        r = make_router()
+        # 注入已知向量：三条 small 种子，各有不同方向
+        r.route_embeddings = {"small": [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], "large": []}
+        r.route_embeddings_text = {"small": ["s_a", "s_b", "s_c"], "large": []}
+        # 查询向量和 [1.0, 0.0] 最接近
+        r.remove_most_similar_seed([0.9, 0.1], "small")
+
+        assert len(r.route_embeddings["small"]) == 2
+        assert "s_a" not in r.route_embeddings_text["small"]
+
+    def test_reload_seeds(self):
+        """从 seed_vectors.json 重载种子"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seed_file = os.path.join(tmpdir, "test_seeds.json")
+            r = make_router(seed_file=seed_file)
+
+            # 用 _save 覆写文件，塞入自定义数据再 reload
+            r.route_embeddings = {"small": [[0.1] * 768], "large": [[0.9] * 768]}
+            r.route_embeddings_text = {"small": ["自定义小"], "large": ["自定义大"]}
+            r._save_seed_vectors()
+
+            # 修改内存数据再 reload，验证从文件恢复
+            r.route_embeddings["small"].append([0.5] * 768)
+            r.reload_seeds()
+
+            assert len(r.route_embeddings["small"]) == 1
+            assert r.route_embeddings_text["small"] == ["自定义小"]

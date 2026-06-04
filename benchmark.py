@@ -7,6 +7,7 @@
 
 import json
 import os
+import statistics
 import sys
 import time
 from contextlib import contextmanager
@@ -75,8 +76,8 @@ def main():
         record(f"余弦 {dim}d (单次)", (t1 - t0) / N, "秒", f"{N} 次平均")
 
     # 3. 批量匹配
-    query_vec = [0.5] * 128
-    seed_vecs = [[i * 0.01 + 0.1 for i in range(128)] for _ in range(100)]
+    query_vec = [0.5] * 768
+    seed_vecs = [[i * 0.01 + 0.1 for i in range(768)] for _ in range(100)]
     N = 1000
     t0 = time.perf_counter()
     for _ in range(N):
@@ -97,7 +98,7 @@ def main():
         ("架构", "设计微服务架构"),
     ]
     for cat, q in queries:
-        with patch.object(r, "_get_embedding", return_value=[0.5] * 128):
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
             N = 500
             with quiet():
                 t0 = time.perf_counter()
@@ -110,10 +111,10 @@ def main():
     print("\n── 4. 错题本规模对决策速度的影响 ──")
     for n in [0, 10, 50, 100]:
         r.mistake_book = [
-            {"query": f"err{i}", "vector": [float(i) / 100] * 128}
+            {"query": f"err{i}", "vector": [float(i) / 100] * 768}
             for i in range(n)
         ]
-        with patch.object(r, "_get_embedding", return_value=[0.5] * 128):
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
             N = 200
             with quiet():
                 t0 = time.perf_counter()
@@ -127,24 +128,34 @@ def main():
         print("\n── 5. API 响应时间 ──")
         from anthropic import Anthropic
         from dotenv import load_dotenv
-        load_dotenv()
+        load_dotenv(override=True)
+        if os.getenv("ANTHROPIC_BASE_URL"):
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
         client = Anthropic(
             base_url=os.getenv("ANTHROPIC_BASE_URL"),
             timeout=120,
         )
 
-        # small
         msg = [{"role": "user", "content": "你好"}]
-        t0 = time.perf_counter()
-        client.messages.create(model="small", messages=msg, max_tokens=10)
-        t1 = time.perf_counter()
-        record("small (deepseek-chat)", t1 - t0, "秒")
+        API_RUNS = 3
+
+        # small
+        times = []
+        for _ in range(API_RUNS):
+            t0 = time.perf_counter()
+            client.messages.create(model="small", messages=msg, max_tokens=10)
+            times.append(time.perf_counter() - t0)
+        record("small (deepseek-chat)", statistics.median(times), "秒",
+               f"{API_RUNS} 次中位数: {', '.join(format_time(t) for t in times)}")
 
         # large
-        t0 = time.perf_counter()
-        client.messages.create(model="large", messages=msg, max_tokens=10)
-        t1 = time.perf_counter()
-        record("large (deepseek-reasoner)", t1 - t0, "秒")
+        times = []
+        for _ in range(API_RUNS):
+            t0 = time.perf_counter()
+            client.messages.create(model="large", messages=msg, max_tokens=10)
+            times.append(time.perf_counter() - t0)
+        record("large (deepseek-v4-pro)", statistics.median(times), "秒",
+               f"{API_RUNS} 次中位数: {', '.join(format_time(t) for t in times)}")
 
         # 路由开销 vs API 开销
         t0 = time.perf_counter()

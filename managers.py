@@ -153,9 +153,19 @@ class BackgroundManager:
 
     def _exec(self, tid: str, command: str, timeout: int):
         try:
+            # 先试 UTF-8，失败回退到系统编码（GBK），避免 API 输出的 UTF-8 被 GBK 解码成乱码
             r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                               capture_output=True, text=True, timeout=timeout)
-            output = (r.stdout + r.stderr).strip()[:50000]
+                               capture_output=True, timeout=timeout)
+            out_bytes = r.stdout + r.stderr
+            output = ""
+            for enc in ['utf-8', 'gbk']:
+                try:
+                    output = out_bytes.decode(enc).strip()[:50000]
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if not output:
+                output = out_bytes.decode('utf-8', errors='replace').strip()[:50000]
             self.tasks[tid].update({"status": "completed", "result": output or "(no output)"})
         except Exception as e:
             self.tasks[tid].update({"status": "error", "result": str(e)})
