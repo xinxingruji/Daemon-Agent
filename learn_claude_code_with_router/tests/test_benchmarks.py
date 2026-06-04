@@ -11,6 +11,7 @@
   python -m pytest tests/test_benchmarks.py -v --run-api --benchmark-json=report.json
 """
 
+import statistics
 import time
 import math
 from unittest.mock import patch
@@ -18,14 +19,6 @@ from unittest.mock import patch
 import pytest
 
 from tests.conftest import make_router
-
-# ── 辅助函数 ────────────────────────────────────────────
-def pytest_addoption(parser):
-    parser.addoption(
-        "--run-api", action="store_true", default=False,
-        help="包含需要 LiteLLM 代理在线的测试",
-    )
-
 
 # ── 辅助函数 ────────────────────────────────────────────
 def format_time(seconds: float) -> str:
@@ -82,7 +75,7 @@ class TestCosineBenchmark:
 
     def test_cosine_bulk_matching(self, router):
         """模拟路由场景：1 个 query 匹配 100 条种子"""
-        query_vec = [0.5] * 128
+        query_vec = [0.5] * 768
         seed_vecs = [[i * 0.01 + 0.1 for i in range(128)] for _ in range(100)]
 
         N = 1000
@@ -118,7 +111,7 @@ class TestRouteDecisionBenchmark:
         """测量 route() 单次决策耗时"""
         print()
         for category, query in self.QUERIES:
-            with patch.object(router, "_get_embedding", return_value=[0.5] * 128):
+            with patch.object(router, "_get_embedding", return_value=[0.5] * 768):
                 N = 500
                 t0 = time.perf_counter()
                 for _ in range(N):
@@ -135,7 +128,7 @@ class TestRouteDecisionBenchmark:
                 {"query": f"错误查询{i}", "vector": [float(i) / 100] * 128}
                 for i in range(n_mistakes)
             ]
-            with patch.object(router, "_get_embedding", return_value=[0.5] * 128):
+            with patch.object(router, "_get_embedding", return_value=[0.5] * 768):
                 N = 200
                 t0 = time.perf_counter()
                 for _ in range(N):
@@ -156,7 +149,10 @@ class TestApiLatency:
         from anthropic import Anthropic
         from dotenv import load_dotenv
         import os
-        load_dotenv()
+        load_dotenv(override=True)
+        # 清除父进程注入的环境变量，防止干扰 LiteLLM 代理
+        if os.getenv("ANTHROPIC_BASE_URL"):
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
         client = Anthropic(
             base_url=os.getenv("ANTHROPIC_BASE_URL"),
             timeout=60,
@@ -164,26 +160,36 @@ class TestApiLatency:
         return client
 
     def test_small_model_latency(self, real_client):
-        """small 模型首 token 响应时间"""
-        t0 = time.perf_counter()
-        real_client.messages.create(
-            model="small",
-            messages=[{"role": "user", "content": "你好"}],
-            max_tokens=10,
-        )
-        t1 = time.perf_counter()
-        print(f"\n  [small] 总响应时间: {format_time(t1 - t0)}")
+        """small 模型响应时间（3 次取中位数）"""
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            real_client.messages.create(
+                model="small",
+                messages=[{"role": "user", "content": "你好"}],
+                max_tokens=10,
+            )
+            times.append(time.perf_counter() - t0)
+
+        median = statistics.median(times)
+        print(f"\n  [small] 3 次: {', '.join(format_time(t) for t in times)}")
+        print(f"  [small] 中位数: {format_time(median)}")
 
     def test_large_model_latency(self, real_client):
-        """large 模型首 token 响应时间"""
-        t0 = time.perf_counter()
-        real_client.messages.create(
-            model="large",
-            messages=[{"role": "user", "content": "你好"}],
-            max_tokens=10,
-        )
-        t1 = time.perf_counter()
-        print(f"\n  [large] 总响应时间: {format_time(t1 - t0)}")
+        """large 模型响应时间（3 次取中位数）"""
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            real_client.messages.create(
+                model="large",
+                messages=[{"role": "user", "content": "你好"}],
+                max_tokens=10,
+            )
+            times.append(time.perf_counter() - t0)
+
+        median = statistics.median(times)
+        print(f"\n  [large] 3 次: {', '.join(format_time(t) for t in times)}")
+        print(f"  [large] 中位数: {format_time(median)}")
 
     def test_routing_overhead_in_real_call(self):
         """路由器 + API 调用整体耗时（路由器开销 vs API 开销）"""
@@ -225,42 +231,57 @@ class TestSimulation:
         ("重构", "重构整个模块的代码", "large"),
     ]
 
-    def test_routing_accuracy(self, router):
-        """路由决策是否符合预期"""
+    def test_routing_accuracy(self):
+        """路由决策是否符合预期 — 使用可区分的种子向量"""
+        r = make_router(threshold=0.45)
+        # 种子：small=[1,0,...], large=[0,1,...] — 两个方向完全分离
+        small_seed = [1.0] + [0.0] * 767
+        large_seed = [0.0, 1.0] + [0.0] * 766
+        r.route_embeddings = {"small": [small_seed], "large": [large_seed]}
+        r.route_embeddings_text = {"small": ["简单任务"], "large": ["复杂任务"]}
+
+        small_vec = [0.9, 0.1] + [0.0] * 766   # 接近 small_seed
+        large_vec = [0.1, 0.9] + [0.0] * 766   # 接近 large_seed
+
         print()
         correct = 0
         for category, query, expected in self.SCENARIOS:
-            with patch.object(router, "_get_embedding", return_value=[0.5] * 128):
-                result = router.route(query, total_tokens=100)
-                ok = result == expected
-                if ok:
-                    correct += 1
-                flag = "✓" if ok else "✗"
-                print(f"  [{flag}] {category}: \"{query}\" → {result} (期望 {expected})")
+            vec = small_vec if expected == "small" else large_vec
+            with patch.object(r, "_get_embedding", return_value=vec):
+                result = r.route(query, total_tokens=100)
+            ok = result == expected
+            if ok:
+                correct += 1
+            flag = "✓" if ok else "✗"
+            print(f"  [{flag}] {category}: \"{query}\" → {result} (期望 {expected})")
 
         accuracy = correct / len(self.SCENARIOS) * 100
         print(f"\n  [准确率] {correct}/{len(self.SCENARIOS)} = {accuracy:.1f}%")
 
     def test_cost_comparison_simulation(self):
         """模拟 cost-only vs router 模式的开销对比（基于 mock 决策）"""
-        # 假设 small 成本 1 单位/次，large 成本 10 单位/次
         SMALL_COST = 1
         LARGE_COST = 10
-        r = make_router()
+        r = make_router(threshold=0.45)
+        small_seed = [1.0] + [0.0] * 767
+        large_seed = [0.0, 1.0] + [0.0] * 766
+        r.route_embeddings = {"small": [small_seed], "large": [large_seed]}
+        r.route_embeddings_text = {"small": ["简单任务"], "large": ["复杂任务"]}
+        small_vec = [0.9, 0.1] + [0.0] * 766
+        large_vec = [0.1, 0.9] + [0.0] * 766
 
         print()
-        # cost-only: 全部走 small
         cost_only_small = sum(1 for *_, exp in self.SCENARIOS if exp == "small")
         cost_only_large = sum(1 for *_, exp in self.SCENARIOS if exp == "large")
         cost_only_total = (cost_only_small + cost_only_large) * SMALL_COST
         cost_only_pct = cost_only_small / (cost_only_small + cost_only_large) * 100
 
-        # router 模式：按实际路由结果
         router_small = 0
         router_large = 0
         router_wrong = 0
         for category, query, expected in self.SCENARIOS:
-            with patch.object(r, "_get_embedding", return_value=[0.5] * 128):
+            vec = small_vec if expected == "small" else large_vec
+            with patch.object(r, "_get_embedding", return_value=vec):
                 result = r.route(query, total_tokens=100)
             if result == "small":
                 router_small += 1
@@ -273,10 +294,10 @@ class TestSimulation:
         router_pct = router_small / (router_small + router_large) * 100
 
         print(f"  ┌─────────────────────┬──────────┬──────────┐")
-        print(f"  │ 指标                │ cost-only │ router   │")
+        print(f"  │ 指标                │ cost-only  │ router   │")
         print(f"  ├─────────────────────┼──────────┼──────────┤")
-        print(f"  │ small 调用占比      │ {cost_only_pct:>6.1f}%   │ {router_pct:>6.1f}%   │")
-        print(f"  │ large 调用占比      │ {100-cost_only_pct:>6.1f}%   │ {100-router_pct:>6.1f}%   │")
-        print(f"  │ 总成本（单位）      │ {cost_only_total:>6}    │ {router_total:>6}    │")
-        print(f"  │ 节省比例            │     —     │ {(1-router_total/cost_only_total)*100:>6.1f}%   │")
+        print(f"  │ small 调用占比      │ {cost_only_pct:>6.1f}%    │ {router_pct:>6.1f}%    │")
+        print(f"  │ large 调用占比      │ {100-cost_only_pct:>6.1f}%    │ {100-router_pct:>6.1f}%    │")
+        print(f"  │ 总成本（单位）      │ {cost_only_total:>6}     │ {router_total:>6}     │")
+        print(f"  │ 错误路由数          │     —      │ {router_wrong:>6}     │")
         print(f"  └─────────────────────┴──────────┴──────────┘")

@@ -13,5 +13,5 @@ model_list:
       api_key: your-api-key
   - model_name: large
     litellm_params:
-      model: deepseek/deepseek-reasoner
+      model: deepseek/deepseek-v4-pro
       api_key: your-api-key

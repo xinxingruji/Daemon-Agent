@@ -2,11 +2,15 @@
 
 
 import json
+import sys
 import threading
 import time
 from config import client, WORKDIR, TEAM_DIR, TASKS_DIR, TRANSCRIPT_DIR, ROUTER, POLL_INTERVAL, IDLE_TIMEOUT
 from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens, is_tool_error
 from managers import MessageBus, TaskManager
+
+# 重配 stdout 编码，防止 UTF-8 内容打印到 GBK 终端时 UnicodeEncodeError
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 def auto_compact(messages: list) -> list:
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
@@ -196,7 +200,24 @@ class TeammateManager:
                                         "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
                                         "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
                             output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        out_str = str(output)
+                        # 按工具类型定制显示，和 main.py 保持一致的风格
+                        path = ""
+                        if hasattr(block, 'input') and 'path' in block.input:
+                            path = block.input['path'].replace(str(WORKDIR), ".")
+                        if block.name == "bash":
+                            print(f"  \033[36m[{name}] > bash:\033[0m")
+                            print(f"  {out_str[:120]}")
+                        elif block.name == "read_file":
+                            lines = out_str.count('\n') if not out_str.startswith("Error:") else 0
+                            if out_str.startswith("Error:"):
+                                print(f"  \033[31m[{name}] ⚠ read_file: {out_str[:120]}\033[0m")
+                            else:
+                                print(f"  \033[34m[{name}] 📄 read_file: {path} ({lines} 行)\033[0m")
+                        elif block.name in ("write_file", "edit_file"):
+                            print(f"  \033[32m[{name}] ✏️ {block.name}: {path}\033[0m")
+                        else:
+                            print(f"  \033[33m[{name}] 🔧 {block.name}: {out_str[:120]}\033[0m")
 
                         # 错题本机制
                         if is_tool_error(output) and current_model == "small":

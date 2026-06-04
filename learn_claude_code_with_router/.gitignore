@@ -30,3 +30,13 @@ benchmark_results.json
 # Config files
 litellm_config.yaml
 
+# Runtime generated
+seed_vectors.json
+mistakes.json
+benchmark_results.json
+
+# Pytest cache
+.pytest_cache/
+
+# Temp files
+query_input.txt
