@@ -1,9 +1,9 @@
-# 技术报告：自适应多智能体框架（Auto-Adaptive Agentic Framework）
+# 技术报告
 
 
 ## 1. 项目背景与概述
 
-本项目源于将大模型能力工程化到生产环境时面临的现实矛盾：大型模型虽然在复杂推理与广泛任务覆盖上表现优异，但其高调用成本、较大延迟、对带宽与隐私的要求，使得在大规模、低成本场景中难以作为默认执行引擎。
+本项目源于将大模型能力工程化到生产环境时面临的现实矛盾：大型模型虽然在复杂推理与广泛任务覆盖上表现优异，但其高调用成本、较大延迟，使得在大规模、低成本场景中难以作为默认执行引擎。
 我们的目标是构建一个“成本优先、风险可控”的多智能体运行时——在语义可控的常见任务上优先使用低成本的小模型以节省资源与降低响应时间；在语义不确定、历史上曾失败或上下文复杂度较高时，系统能自动、安全地升级为能力更强但代价更高的大模型以确保正确性。
 为实现这一目标，项目在工程层面实现了轻量语义路由（预计算种子向量并进行在线嵌入匹配）、错题本失败记忆（将小模型的工具执行失败向量化并持久化）、以及基于会话长度的动态阈值惩罚和可配置的模型映射。这样的设计既能显著减少不必要的大模型调用与响应延迟，又通过针对性记忆与动态保守策略，在遇到已知陷阱或长期上下文膨胀时提供自动防护，从而在成本、性能与可靠性之间建立可控且可度量的折中。
 
@@ -29,8 +29,14 @@
 
 - 微观/宏观双轨路由器 `Claude_Router`（[router.py](router.py)）
     - 目的：在运行时根据语义匹配、历史失败与上下文规模自动选择 `small` 或 `large` 模型，最大化使用低成本小模型同时在风险场景保证正确性。
-    - 实现要点：通过 `precompute_seeds.py` 预处理种子文本为 768 维向量并缓存到 `seed_vectors.json`（8 线程并发，约 10 秒），Router 启动时直接读取（毫秒级）；对查询做在线向量化匹配，结合 `mistake_book` 与动态 token 惩罚计算最终决策；运行时支持 `add_seed`/`remove_most_similar_seed` 动态调整种子库；当嵌入不可用或 `force_large`/`force_small` 为真时返回对应模型。除了预计算静态种子向量外，路由器支持在运行时收集小模型的“成功经验”（add_seed）。为了防止经验库过拟合与膨胀，系统引入了正向经验蒸馏机制：当动态积累的种子数量超过阈值时，自动触发后台大模型（LLM）异步压缩，将几十条零散的具体任务抽象提炼为少数几个高级泛化的“能力锚点”。合并过程采用数组切片算法，严格保护前 N 个出厂静态种子不被修改。
+
+    - 实现要点：通过 `precompute_seeds.py` 预处理种子文本为 768 维向量并缓存到 `seed_vectors.json`（8 线程并发，约 10 秒），Router 启动时直接读取（毫秒级）；对查询做在线向量化匹配，结合 `mistake_book` 与动态 token 惩罚计算最终决策；运行时支持 `add_seed` 动态添加种子（`remove_most_similar_seed` 方法保留但未被主循环调用，改为后台压缩机制统一管理剔除）；当嵌入不可用或 `force_large`/`force_small` 为真时返回对应模型。除了预计算静态种子向量外，路由器支持在运行时收集小模型的“成功经验”（add_seed）。为了防止经验库过拟合与膨胀，系统引入了正向经验蒸馏机制：当动态积累的种子数量超过阈值时，自动触发后台大模型（LLM）异步压缩，将几十条零散的具体任务抽象提炼为少数几个高级泛化的“能力锚点”。合并过程采用数组切片算法，严格保护前 N 个出厂静态种子不被修改。
     - 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险；种子库可在运行中自我进化，适合工程化部署场景。
+
+- 种子库动态增强回路（[main.py](main.py) 的 `agent_loop`）
+    - 目的：在小模型工具执行成功但语义匹配分数较低时，自动将查询文本加入 small 种子库以增强识别能力。
+    - 实现要点：`agent_loop` 中，每轮工具执行后检查 `ROUTER._last_route_scores.get("small", 0.0)`，若小模型成功但得分低于 `threshold + 0.15` 则调用 `add_seed(routing_query, "small")` 将成功经验添加为新的种子锚点；小模型失败时则仅记录错题本（`record_mistake`），种子剔除工作交由后台异步压缩机制统一处理。
+    - 意义：使种子库在运行中具备"成功增强"的自我进化能力，减少人工维护。
 
 - 错题本（mistake book）（[router.py](router.py) 的 `record_mistake` 与 `_load_mistakes`）
     - 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
@@ -41,6 +47,11 @@
     - 目的：当对话/上下文变长时，适当提高小模型被判定为可行的相似度阈值，避免在长上下文中误判小模型能胜任复杂推理或状态管理任务。
     - 实现要点：根据 `total_tokens`、`safe_tokens`、`penalty_step` 与 `penalty_rate` 计算 `dynamic_threshold`，并在 `best_route=='small'` 时用其替代静态阈值以决定是否仍选小模型。
     - 意义：在成本与正确性之间建立可控权衡；减少因历史上下文累积导致的小模型错误，提升系统在长期会话/任务中的稳定性。
+
+- REPL 强制模型前缀机制（[main.py](main.py) 的 `force_mode` 参数）
+    - 目的：在交互式终端中，用户可以通过 `!large 查询` 或 `!small 查询` 前缀临时覆盖路由决策，便于调试、验证模型差异或处理边界情况。
+    - 实现要点：`agent_loop` 接受 `force_mode` 参数（"large"/"small"/""），将其透传给 `ROUTER.route()` 的 `force_large`/`force_small` 参数；REPL 层在读取用户输入时检测前缀并剥离。
+    - 意义：提供人工干预的逃生口，兼顾自动化路由与人工灵活控制。
 
 - 工程化的模型映射与可配置调度（[config.py](config.py), [litellm_config.yaml](litellm_config.yaml)）
     - 目的：把模型选择与底层提供者（LiteLLM/Anthropic/本地代理）解耦，使小/大模型映射可通过配置调整而无需改动路由器代码。
@@ -57,7 +68,7 @@
 
 系统内部的核心数据流是单向推进、局部回写的：用户输入进入消息队列后，先被估算 token，再被路由决策；模型输出若触发工具执行，则通过 [core_tools.py](core_tools.py) 的本地命令与读写函数、[managers.py](managers.py) 的任务/消息/后台管理器、[team.py](team.py) 的子智能体与队友线程进行处理；执行结果会作为 `tool_result` 再次写回 messages。与此同时，任务文件、消息队列、队友配置、转录记录和错题本也会分别落在 `.tasks`、`.team/inbox`、`.team/config.json`、`.transcripts` 和 `mistakes.json` 中，保证系统的状态不是只存在于内存里。
 
-整体模块关系如下：
+整体模块关系如下（虚线表示后台异步路径，实线表示主循环同步路径）：
 
 ```mermaid
 flowchart TD
@@ -75,13 +86,27 @@ flowchart TD
     G --> S2[任务、Todo、消息、后台任务]
     H --> S3[子智能体与队友线程]
     T --> M
-    R --> MB[mistakes.json]
+
+    %% 种子库动态增强回路（主循环同步路径）
+    T -.->|小模型成功得分低| FB[add_seed 正向增强]
+    FB --> R
+
+    %% 后台异步压缩线程
+    R -.->|错题本超限| AC1[_trigger_compression_async<br/>mistake]
+    R -.->|动态种子超限| AC2[_trigger_compression_async<br/>seed]
+    AC1 --> LLMBG[后台大模型压缩]
+    AC2 --> LLMBG
+    LLMBG -.->|快照合并| R
+
+    %% 持久化
+    R --> MB[mistakes.json / seed_vectors.json]
     S1 --> D[工作区状态]
     S2 --> D
     S3 --> D
 ```
 
-从设计目标上看，这一架构的重点不是“功能堆叠”，而是把高频、低风险、低成本任务尽量放到小模型和本地工具上，把高风险、语义复杂、上下文膨胀的任务自动升级到大模型。也就是说，模型选择不是硬编码的全局常量，而是运行时动态决策的结果。
+上图中，**实线箭头**表示主循环同步路径——每轮 ReAct 闭环的关键节点（路由决策、模型调用、工具执行、结果回灌）都经此推进；**虚线箭头**则代表两条后台异步路径：一条是工具执行后若小模型成功但得分较低，通过 `add_seed` 将查询文本动态注入种子库（种子库动态增强回路）；另一条是当错题本或动态种子超限时，Router 在后台守护线程中唤醒大模型做知识蒸馏压缩，压缩后的快照通过切片合并算法无缝写回内存。两条异步路径均不阻塞主循环。
+
 
 
 ## 4. 交互流程
@@ -107,7 +132,7 @@ sequenceDiagram
     participant Tool as 工具层
     participant Team as Teammate/Task/Bus
 
-    User->>Main: 输入任务
+    User->>Main: 输入任务（或 !large / !small 强制前缀）
     Main->>Main: 压缩上下文/检查 token
     Main->>Router: 发送 query 与 token 数
     Router-->>Main: 返回 small 或 large
@@ -116,7 +141,11 @@ sequenceDiagram
     alt 产生工具调用
         Main->>Tool: 执行 bash/read/write/edit 等
         Tool-->>Main: 返回执行结果
-        Main->>Router: 若 small 且失败，记录错题本
+        alt small 且失败
+            Main->>Router: record_mistake 记录错题本
+        else small 成功但得分低
+            Main->>Router: add_seed 正向增强种子库
+        end
         Main->>LLM: 将 tool_result 回灌
     else 直接完成
         Main-->>User: 结束本轮回答
@@ -125,7 +154,13 @@ sequenceDiagram
         Main->>Team: 分派任务/发送消息/认领任务
         Team-->>Main: 同步或异步反馈
     end
+    opt 用户输入命令
+        User->>Main: /reload 热重载种子库
+        Main->>Router: reload_seeds()
+    end
 ```
+
+三条关键交互路径：① 用户输入侧的 `!large / !small` 强制前缀，可直接覆盖路由决策（绕过三阶段判定），方便调试与人工干预；② 工具执行后根据小模型的表现分流——失败时记入错题本（`record_mistake`），成功但语义匹配得分低时触发正向种子增强（`add_seed`），两种反馈各自驱动种子库的自我进化；③ 用户可通过 `/reload` 命令热重载 `seed_vectors.json`，无需重启进程即可使种子库修改生效。
 
 这个流程的关键特征是“可回路、可分支、可持久化”。一方面它允许单轮任务快速完成，另一方面也允许任务在多轮、多角色之间传递，并且每个关键节点都有文件化状态支撑，不依赖进程内瞬时变量。
 
@@ -144,7 +179,7 @@ sequenceDiagram
 
 为消除每次启动都要逐条调 Ollama 嵌入的启动延迟（82 条种子串行约 80 秒），项目新增了 `precompute_seeds.py` 预处理脚本与 `seed_vectors.json` 向量缓存机制。`precompute_seeds.py` 使用 8 线程并发调用 Ollama 一次性完成所有种子文本的向量化并写入 JSON 文件（实测约 10 秒）；Router 启动时优先读取 `seed_vectors.json`（毫秒级），仅在文件不存在时回退到逐条 Ollama 嵌入的初始化方式并自动写出缓存。种子文本与向量分开存储，`route_embeddings_text` 记录每条向量的原始文本，供运行时动态增删种子使用。
 
-Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新查询文本向量化并追加到指定路由类别（small/large），`remove_most_similar_seed(query_vector, route)` 按余弦相似度找到最匹配的种子并将其删除，`reload_seeds()` 支持热重载 `seed_vectors.json` 而无需重启进程。`route()` 方法新增 `force_small` 参数（为 True 时直接返回 "small"），同时记录 `_last_query_vector`、`_last_route_scores` 和 `_last_best_route`，供主循环的种子反馈逻辑使用。路由决策核心（错题本 → 语义匹配 → token 惩罚）本身未变。
+Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新查询文本向量化并追加到指定路由类别（small/large），`reload_seeds()` 支持热重载 `seed_vectors.json` 而无需重启进程。`remove_most_similar_seed(query_vector, route)` 方法仍保留但未被 `main.py` 调用，种子库的剔除由后台异步压缩机制统一管理。`route()` 方法新增 `force_small` 参数（为 True 时直接返回 "small"），同时记录 `_last_query_vector`、`_last_route_scores` 和 `_last_best_route`，供主循环的种子反馈逻辑使用。路由决策核心（错题本 → 语义匹配 → token 惩罚）本身未变。
 
 `_get_embedding(text)` 的实现是一次简单的 HTTP POST 请求，失败时直接返回空列表；而 `route(...)` 会把这个失败视为保守信号，直接回退到 `large`。这是一种典型的 fail-safe 逻辑：向量不可用时宁可升大模型，也不把任务误派给小模型。
 
@@ -163,13 +198,13 @@ Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新�
 
 `TOOLS` 和 `TOOL_HANDLERS` 是主循环的两个关键表。`TOOLS` 定义了工具 schema，告诉大模型每个工具的名字、输入字段和约束；`TOOL_HANDLERS` 则把工具名映射到实际 Python 函数。真正执行时，模型先返回 tool_use block，主循环再根据 `block.name` 从 `TOOL_HANDLERS` 取处理函数，最终把输出包装成 `tool_result` 送回模型。这个“模型提议动作、代码执行动作、结果回灌”的回路，就是标准的 ReAct 控制逻辑。
 
-`agent_loop` 内部还有三段很具体的控制逻辑。第一段是上下文控制：每轮先跑 `microcompact(messages)`，再用 `estimate_tokens(messages)` 判断是否超过 `TOKEN_THRESHOLD`，超过后立刻调用 `auto_compact(messages)` 生成摘要替换历史消息。第二段是路由控制：它不是直接拿用户 query 去路由，而是优先查看 `TODO.items`，如果存在 `in_progress` 任务，就用任务内容作为 `routing_query`；否则才回退到原始 query。第三段是失败回写：只要本轮模型是 `small`，且某个工具输出被 `is_tool_error` 判定为失败，就把当前任务语义和失败工具名拼成 `mistake_context`，再交给 `ROUTER.record_mistake(...)` 写入错题本。
+`agent_loop` 内部还有四段很具体的控制逻辑。第一段是上下文控制：每轮先跑 `microcompact(messages)`，再用 `estimate_tokens(messages)` 判断是否超过 `TOKEN_THRESHOLD`，超过后立刻调用 `auto_compact(messages)` 生成摘要替换历史消息。第二段是路由控制：它不是直接拿用户 query 去路由，而是优先查看 `TODO.items`，如果存在 `in_progress` 任务，就用任务内容作为 `routing_query`；否则才回退到原始 query。第三段是失败回写（错题本 + 模型升级）：只要本轮模型是 `small`，且某个工具输出被 `is_tool_error` 判定为失败，就把当前任务语义和失败工具名拼成 `mistake_context`，再交给 `ROUTER.record_mistake(...)` 写入错题本；后续路由遇到相似查询时会触发错题本拦截，自动升级到 `large`。第四段是正向种子增强：若小模型成功但语义匹配分数低于 `threshold + 0.15`，自动调用 `add_seed` 将查询文本加入 small 种子库，增强对类似任务的识别能力。
+
+需要特别说明的是，`is_tool_error` 函数在此处定义了一套更全面的错误判定规则（涵盖 `"Error:"`, `"Traceback"`, `"Fatal:"`, `"Trace/BPT trap"` 等前缀以及 `"(subagent failed)"`、`"Unknown tool"` 等隐式失败标志），同时在 [core_tools.py](core_tools.py) 中保留了相同定义的版本供子智能体复用。两处定义保持一致，但各自服务于不同的调用层级。
 
 REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是对内存状态和文件状态的直接读操作，不经过模型推理，因此非常适合做人工排查和调试入口。新增 `/reload` 命令用于热重载 `seed_vectors.json`，无需重启进程即可使种子库修改生效。
 
 此外，REPL 支持在查询前加模型强制前缀：`!large 查询内容` 跳过路由强制使用大模型，`!small 查询内容` 强制使用小模型；不加前缀则正常走三阶段路由。
-
-agent_loop 工具执行阶段新增种子库动态反馈逻辑：当小模型工具调用失败时，除原有的错题本记录外，还调用 `remove_most_similar_seed` 删除最匹配的那条 small 种子，避免后续重复误判；当小模型成功但语义匹配分数低于 `threshold + 0.15` 时，自动调用 `add_seed` 将查询文本加入 small 种子库，增强对类似任务的识别能力。
 
 ### 5.4 `core_tools.py`：安全的本地执行层
 
@@ -211,7 +246,7 @@ agent_loop 工具执行阶段新增种子库动态反馈逻辑：当小模型工
 
 - 持久化目录由 [config.py](config.py) 定义，包含 `.team`、`.tasks`、`.transcripts` 等子目录；系统通过这些目录保存运行时状态以便重启恢复。
 - 种子向量缓存文件 `seed_vectors.json`，由 `precompute_seeds.py` 一次性生成（8 线程并发 Ollama，约 10 秒），Router 启动时直接读取（毫秒级）。文件结构为 `{"small": [{"text": "...", "vector": [...]}, ...], "large": [...]}`，文本与向量一一对应，支持运行时动态增删。
-- 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加或在超限时覆盖重写的策略。
+- 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加方式；超限时触发后台异步 LLM 压缩浓缩，而非简单的 FIFO 淘汰。
 - 任务与队友配置以 `task_{id}.json`、`team/config.json` 等 JSON 文件保存在对应子目录，程序启动时会读取这些文件恢复任务板与队友状态；写入异常会记录日志但不会抛出未处理异常。
 
 ## 7. 部署与运行
@@ -281,7 +316,8 @@ python main.py
 
 - 鲁棒性：
     - 路由器在 [router.py](router.py) 中通过 `_get_embedding` 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时，`_get_embedding` 返回空向量，`route(...)` 在此情况下保守地返回 `large`。
-    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数超过 `max_mistakes`（默认 200）时，最早条目会被移除并触发覆盖式重写以持久化删除。
+
+    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数超过 `max_mistakes`（默认 200）时，不再采用简单的 FIFO 淘汰，而是触发后台异步 LLM 压缩（`_trigger_compression_async("mistake")`），将具体报错浓缩为高度概括的通用拦截指令，并通过双重可重入锁（RLock）与快照切片算法无缝覆写内存、持久化到文件。主循环零阻塞。
 
 - 限制：
     - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，未集成专用近似最近邻索引（如 FAISS/annoy）。在错题本或种子向量规模较大时，查询复杂度为 O(n)，可能成为性能瓶颈。
