@@ -88,7 +88,20 @@ litellm --config litellm_config.yaml --port 4000
 
 ---
 
-## 4. 环境配置与启动主程序
+## 4. 预处理种子向量（首次运行前执行一次）
+
+运行预处理脚本，将 `utterances.py` 中的种子文本一次性转为向量缓存：
+
+```bash
+python precompute_seeds.py
+
+```
+
+> 本脚本使用 8 线程并发调用 Ollama，约 10 秒完成（82 条种子）。生成 `seed_vectors.json`（约 1.8 MB）后，Router 启动时将直接读取该文件（毫秒级），无需每次启动都重新嵌入。之后若修改了 `utterances.py`，需重新运行本脚本更新缓存。
+
+---
+
+## 5. 环境配置与启动主程序
 
 ### 环境变量配置
 
@@ -117,23 +130,23 @@ python main.py
 
 *(注：如果你的主入口文件仍然叫 `s_full.py`，请替换为 `python s_full.py`)*
 
-进入 `s_full >>` 终端后，输入你的任务，尽情感受智能体在小模型与大模型之间丝滑切换的技术美学吧！
+进入 `Daemon >>` 终端后，输入你的任务。支持 `!large` / `!small` 前缀强制指定模型，`/reload` 热重载种子库。
 
 ```
 
 ---
 
-## 5. 测试
+## 6. 测试
 
 本项目提供两类测试：正确性测试（pytest，纯逻辑验证）和性能基准测试（benchmark，含本地 + API 两种模式）。
 
-### 5.1 正确性测试（不依赖外部服务）
+### 6.1 正确性测试（不依赖外部服务）
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-共包含 28 项测试，所有测试均不依赖 Ollama、不调用 API、不写入真实文件，通过 mock 隔离外部依赖。
+共包含 34 项测试（不含 API 模式 31 项），所有测试均不依赖 Ollama、不调用 API、不写入真实文件，通过 mock 隔离外部依赖。
 
 **测试内容：**
 
@@ -141,15 +154,16 @@ python -m pytest tests/ -v
 |------|------|--------|--------|
 | 种子数据完整性 | [tests/test_utterances.py](tests/test_utterances.py) | 4 | SMALL/LARGE 非空、无重复 |
 | 余弦相似度 | [tests/test_router.py](tests/test_router.py) | 4 | 相同向量 → 1.0、正交 → 0、相反 → -1.0、空向量 → 0 |
-| 路由决策 | [tests/test_router.py](tests/test_router.py) | 5 | force_large 强制升级、空 query 保守兜底、错题本拦截、低于阈值降级、token 惩罚动态升阶 |
+| 路由决策 | [tests/test_router.py](tests/test_router.py) | 6 | force_large/force_small 强制升级/降级、空 query 保守兜底、错题本拦截、低于阈值降级、token 惩罚动态升阶 |
 | 错题本管理 | [tests/test_router.py](tests/test_router.py) | 2 | 失败记录写入 JSONL、超出容量时 FIFO 淘汰 |
-| 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟 |
+| 种子库管理 | [tests/test_router.py](tests/test_router.py) | 5 | 添加种子、去重、空文本跳过、按相似度删除、热重载 |
+| 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟、API 延迟多次测量 |
 
 **运行环境要求：**
 - 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）
 - 只需要 Python 环境已安装 `pytest` 和项目依赖
 
-### 5.2 性能基准测试
+### 6.2 性能基准测试
 
 单独的性能基准脚本 [benchmark.py](benchmark.py)，输出格式化表格并导出 JSON 文件。
 
@@ -175,7 +189,7 @@ python benchmark.py --api
 
 **额外测试内容：** 在本地测试的基础上，新增：
 - small 模型（deepseek-chat）真实 API 响应时间
-- large 模型（deepseek-reasoner）真实 API 响应时间
+- large 模型（deepseek-v4-pro）真实 API 响应时间
 - 路由决策真实开销（含 Ollama 嵌入调用）
 
 **输出位置：** 同样写入 `benchmark_results.json`，包含 API 延迟数据。
@@ -194,7 +208,7 @@ python benchmark.py --api
 ```json
 [
   { "name": "路由初始化总耗时", "value": 0.000742, "unit": "秒", "detail": "81 条种子向量" },
-  { "name": "small (deepseek-chat)", "value": 0.875, "unit": "秒", "detail": "" },
+  { "name": "small (deepseek-chat)", "value": 0.736, "unit": "秒", "detail": "3 次中位数: 789ms, 720ms, 736ms" },
   ...
 ]
 ```

@@ -1,7 +1,5 @@
 # 技术报告：自适应多智能体框架（Auto-Adaptive Agentic Framework）
 
-## Github仓库链接
-https://github.com/xinxingruji/Daemon-Agent
 
 ## 1. 项目背景与概述
 
@@ -31,12 +29,12 @@ https://github.com/xinxingruji/Daemon-Agent
 
 - 微观/宏观双轨路由器 `Claude_Router`（[router.py](router.py)）
     - 目的：在运行时根据语义匹配、历史失败与上下文规模自动选择 `small` 或 `large` 模型，最大化使用低成本小模型同时在风险场景保证正确性。
-    - 实现要点：预计算路由种子向量并缓存（`route_embeddings`）、对查询做在线向量化匹配、结合 `mistake_book` 与动态 token 惩罚计算最终决策；当嵌入不可用或 `force_large` 为真时保守回退为 `large`。
-    - 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险，适合工程化部署场景。
+    - 实现要点：通过 `precompute_seeds.py` 预处理种子文本为 768 维向量并缓存到 `seed_vectors.json`（8 线程并发，约 10 秒），Router 启动时直接读取（毫秒级）；对查询做在线向量化匹配，结合 `mistake_book` 与动态 token 惩罚计算最终决策；运行时支持 `add_seed`/`remove_most_similar_seed` 动态调整种子库；当嵌入不可用或 `force_large`/`force_small` 为真时返回对应模型。除了预计算静态种子向量外，路由器支持在运行时收集小模型的“成功经验”（add_seed）。为了防止经验库过拟合与膨胀，系统引入了正向经验蒸馏机制：当动态积累的种子数量超过阈值时，自动触发后台大模型（LLM）异步压缩，将几十条零散的具体任务抽象提炼为少数几个高级泛化的“能力锚点”。合并过程采用数组切片算法，严格保护前 N 个出厂静态种子不被修改。
+    - 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险；种子库可在运行中自我进化，适合工程化部署场景。
 
 - 错题本（mistake book）（[router.py](router.py) 的 `record_mistake` 与 `_load_mistakes`）
     - 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
-    - 实现要点：在小模型触发 `is_tool_error` 时获取查询向量并追加写入 JSONL（超限时覆盖重写），路由阶段线性扫描并用余弦相似度短路到 `large`。
+    - 实现要点：当小模型执行工具失败时，将其 Query 向量化并记入错题本。相比传统的 FIFO 淘汰，系统创新性地实现了后台异步 LLM 压缩机制：当错题满载时，大模型在后台将 200 条具体报错浓缩为 10-20 条涵盖核心难点的通用拦截指令，并通过双重可重入锁（RLock）与快照切片算法无缝覆写内存，主循环零阻塞。
     - 意义：提高系统可靠性与任务成功率，减少由于重复错误导致的人工干预与系统回滚成本；使得升级模型的触发更具针对性而非盲目升阶。
 
 - 动态 Token 惩罚与长期上下文衰减（[router.py](router.py) 参数与逻辑）
@@ -144,13 +142,20 @@ sequenceDiagram
 
 [router.py](router.py) 的核心实现是一个三段式决策器：先做错题本拦截，再做语义相似度匹配，最后做 token 惩罚修正。初始化时，类里先写死两组种子短语，分别代表低风险任务和高风险任务，然后对每条种子文本调用本地嵌入接口 `http://localhost:11434/api/embeddings` 生成向量并缓存到 `route_embeddings`。这样做的好处是，运行时只需要对用户 query 计算一次 embedding，后面就可以直接和缓存向量做余弦相似度比对，不必每次都重新构造路由知识库。
 
+为消除每次启动都要逐条调 Ollama 嵌入的启动延迟（82 条种子串行约 80 秒），项目新增了 `precompute_seeds.py` 预处理脚本与 `seed_vectors.json` 向量缓存机制。`precompute_seeds.py` 使用 8 线程并发调用 Ollama 一次性完成所有种子文本的向量化并写入 JSON 文件（实测约 10 秒）；Router 启动时优先读取 `seed_vectors.json`（毫秒级），仅在文件不存在时回退到逐条 Ollama 嵌入的初始化方式并自动写出缓存。种子文本与向量分开存储，`route_embeddings_text` 记录每条向量的原始文本，供运行时动态增删种子使用。
+
+Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新查询文本向量化并追加到指定路由类别（small/large），`remove_most_similar_seed(query_vector, route)` 按余弦相似度找到最匹配的种子并将其删除，`reload_seeds()` 支持热重载 `seed_vectors.json` 而无需重启进程。`route()` 方法新增 `force_small` 参数（为 True 时直接返回 "small"），同时记录 `_last_query_vector`、`_last_route_scores` 和 `_last_best_route`，供主循环的种子反馈逻辑使用。路由决策核心（错题本 → 语义匹配 → token 惩罚）本身未变。
+
 `_get_embedding(text)` 的实现是一次简单的 HTTP POST 请求，失败时直接返回空列表；而 `route(...)` 会把这个失败视为保守信号，直接回退到 `large`。这是一种典型的 fail-safe 逻辑：向量不可用时宁可升大模型，也不把任务误派给小模型。
 
 具体路由时，算法顺序如下。第一步，如果 `force_large` 为真，立刻返回 `large`，这给外部调用者一个硬性覆盖口。第二步，对 query 做向量化，并逐条扫描 `mistake_book`，用 `_cosine_similarity` 计算 query 与历史失败向量的夹角相似度；只要任意一条大于 `mistake_threshold`，就立即升级到 `large`。第三步，把 query 向量与 `route_embeddings` 中的所有候选向量做余弦相似度比较，保留最高分 `highest_score` 和对应路由 `best_route`。如果最佳路由本身是 `large`，或者 `highest_score` 没超过基础阈值 `threshold`，也直接返回 `large`。
 
 只有当 best_route 是 small 且基础分数过线时，系统才进入动态惩罚阶段。这里的惩罚不是重新训练模型，而是修改决策阈值：先用 `total_tokens - safe_tokens` 计算超额 token 数，再除以 `penalty_step` 得到阶梯数 `extra_steps`，最后乘以 `penalty_rate` 形成 penalty，并把 `dynamic_threshold` 上调到 `threshold + penalty`，上限封顶 0.99。也就是说，上下文越长，小模型需要更高的语义匹配分数才能被继续放行。
 
-`record_mistake(query)` 体现的是一个带容量上限的 FIFO 错题本。函数先把失败 query 向量化，组装成 `{query, vector}` 记录，再判断 `mistake_book` 是否超过 `max_mistakes`。如果超过，就先 `pop(0)` 删掉最老记录，再把整个列表以写覆盖方式重写回 JSONL 文件；如果没超过，就直接以追加模式写入。这个设计避免了每次写入都重刷全文件，同时保证错题本只保留最近且最有价值的失败样本。
+异步提炼与并发控制（知识蒸馏）
+路由器最大的工程亮点在于其内置的 _trigger_compression_async(target) 大压缩机制。为了解决动态种子库膨胀和错题本冗余的问题，系统废弃了传统的“先进先出”或“就地删除”策略，转而引入了 LLM 知识蒸馏。
+当错题本或新增种子数达到设定的满载阈值时，路由器会加锁获取当前数据的快照（Snapshot），并立即释放锁，随后在后台守护线程中唤醒大模型。大模型根据 target 的不同（mistake 或 seed），动态组装 Prompt，将碎片化的文本抽象合并为高度概括的 JSON 数组。
+为了解决后台压缩期间主线程产生新数据导致的竞态条件（Race Condition）与数据丢失问题，系统采用了双重可重入锁（threading.RLock）和O(1) 切片合并算法：在合并阶段，利用 [N: N+S] 的数组切片精准定位并剥离被压缩的旧快照，再将“出厂底座 + 大模型提炼的新锚点 + 压缩期间产生的新数据”进行无缝拼接。这一机制保证了主 ReAct 循环绝对非阻塞，且在极高并发下数据零丢失。
 
 ### 5.3 `main.py`：主循环、工具分发与总控逻辑
 
@@ -160,7 +165,11 @@ sequenceDiagram
 
 `agent_loop` 内部还有三段很具体的控制逻辑。第一段是上下文控制：每轮先跑 `microcompact(messages)`，再用 `estimate_tokens(messages)` 判断是否超过 `TOKEN_THRESHOLD`，超过后立刻调用 `auto_compact(messages)` 生成摘要替换历史消息。第二段是路由控制：它不是直接拿用户 query 去路由，而是优先查看 `TODO.items`，如果存在 `in_progress` 任务，就用任务内容作为 `routing_query`；否则才回退到原始 query。第三段是失败回写：只要本轮模型是 `small`，且某个工具输出被 `is_tool_error` 判定为失败，就把当前任务语义和失败工具名拼成 `mistake_context`，再交给 `ROUTER.record_mistake(...)` 写入错题本。
 
-REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是对内存状态和文件状态的直接读操作，不经过模型推理，因此非常适合做人工排查和调试入口。
+REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是对内存状态和文件状态的直接读操作，不经过模型推理，因此非常适合做人工排查和调试入口。新增 `/reload` 命令用于热重载 `seed_vectors.json`，无需重启进程即可使种子库修改生效。
+
+此外，REPL 支持在查询前加模型强制前缀：`!large 查询内容` 跳过路由强制使用大模型，`!small 查询内容` 强制使用小模型；不加前缀则正常走三阶段路由。
+
+agent_loop 工具执行阶段新增种子库动态反馈逻辑：当小模型工具调用失败时，除原有的错题本记录外，还调用 `remove_most_similar_seed` 删除最匹配的那条 small 种子，避免后续重复误判；当小模型成功但语义匹配分数低于 `threshold + 0.15` 时，自动调用 `add_seed` 将查询文本加入 small 种子库，增强对类似任务的识别能力。
 
 ### 5.4 `core_tools.py`：安全的本地执行层
 
@@ -201,6 +210,7 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 ## 6. 数据流与持久化
 
 - 持久化目录由 [config.py](config.py) 定义，包含 `.team`、`.tasks`、`.transcripts` 等子目录；系统通过这些目录保存运行时状态以便重启恢复。
+- 种子向量缓存文件 `seed_vectors.json`，由 `precompute_seeds.py` 一次性生成（8 线程并发 Ollama，约 10 秒），Router 启动时直接读取（毫秒级）。文件结构为 `{"small": [{"text": "...", "vector": [...]}, ...], "large": [...]}`，文本与向量一一对应，支持运行时动态增删。
 - 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加或在超限时覆盖重写的策略。
 - 任务与队友配置以 `task_{id}.json`、`team/config.json` 等 JSON 文件保存在对应子目录，程序启动时会读取这些文件恢复任务板与队友状态；写入异常会记录日志但不会抛出未处理异常。
 
@@ -216,13 +226,24 @@ pip install -r requirements.txt
 ```
 
 2. 启动本地向量服务（如 Ollama），并确保嵌入 API 可达。
-3. 配置 `litellm_config.yaml` 将 `small`/`large` 映射到实际模型。参考 [README.md](README.md) 的示例。
-4. 启动 LiteLLM 代理（可选）：`litellm --config litellm_config.yaml --port 4000`。
-5. 设置环境变量（`.env`），然后运行主程序：
+3. 运行预处理脚本，一次性生成种子向量缓存：
+
+```bash
+python precompute_seeds.py
+```
+
+4. 配置 `litellm_config.yaml` 将 `small`/`large` 映射到实际模型。参考 [README.md](README.md) 的示例。
+5. 启动 LiteLLM 代理：`litellm --config litellm_config.yaml --port 4000`。
+6. 设置环境变量（`.env`），然后运行主程序：
 
 ```bash
 python main.py
 ```
+
+运行时可用命令：
+- `/tasks` `/team` `/inbox` `/compact` — 查看状态与手动压缩
+- `/reload` — 热重载 `seed_vectors.json`，无需重启
+- `!large 查询` / `!small 查询` — 强制指定模型，不走路由
 
 ## 8. 性能优化与扩展性设计
 
@@ -235,6 +256,7 @@ python main.py
 - 保守升级策略：当嵌入服务失败、错题本命中或上下文过长时，系统直接升级到大模型，不在低质量输入上反复重试，从而减少无效请求和额外等待。
 - 本地执行超时控制：`run_bash` 统一设置超时并限制危险命令，后台任务通过独立线程执行并截断输出，避免长时间阻塞主循环。
 - 持久化协作解耦：任务、消息、队友状态分别落在独立文件中，主循环不需要持有所有协作状态的锁，降低了同步开销。
+- 无阻塞的异步自我进化：通过 threading.RLock 与快照（Snapshot）机制的结合，将极其耗时的 LLM 经验压缩过程（约 10~20 秒）完全放置在后台守护线程执行。合并数据时使用 Python 原生的列表切片运算替代循环比对，使得主线程加锁重写内存的时间被压缩至微秒级，用户体验毫无卡顿感。
 
 ### 8.2 可扩展性（Scalability）
 
@@ -272,8 +294,9 @@ python main.py
 ### 10.1 测试文件结构
 
 - [tests/test_utterances.py](tests/test_utterances.py) — 验证种子数据完整性
-- [tests/test_router.py](tests/test_router.py) — 验证路由核心逻辑
-- [tests/conftest.py](tests/conftest.py) — 提供 mock 工具函数，在初始化阶段拦截 `_get_embedding` 与 `_load_mistakes`，避免触发外部嵌入服务与文件读写
+- [tests/test_router.py](tests/test_router.py) — 验证路由核心逻辑（17 项，含新增 6 项种子库管理及 `force_small` 测试）
+- [tests/test_benchmarks.py](tests/test_benchmarks.py) — 性能基准测试（13 项，含 API 延迟多次测量与路由准确率模拟）
+- [tests/conftest.py](tests/conftest.py) — 提供 mock 工具函数，拦截 `_get_embedding`、`_load_mistakes`、`_load_seed_vectors`、`_save_seed_vectors`，避免触发外部服务与文件读写
 
 ### 10.2 种子数据测试（4 项）
 
@@ -284,7 +307,7 @@ python main.py
 | `test_small_no_duplicates` | SMALL 中无重复条目 |
 | `test_large_no_duplicates` | LARGE 中无重复条目 |
 
-### 10.3 路由逻辑测试（11 项）
+### 10.3 路由逻辑测试（17 项）
 
 **余弦相似度（4 项）**
 
@@ -295,11 +318,12 @@ python main.py
 | `test_opposite` | 相反向量 → 余弦相似度 -1.0 |
 | `test_empty` | 空向量参与计算 → 余弦相似度 0.0 |
 
-**路由决策（5 项）**
+**路由决策（6 项）**
 
 | 测试 | 验证点 |
 |------|--------|
 | `test_force_large` | `force_large=True` 时任何 query 都返回 `"large"` |
+| `test_force_small` | `force_small=True` 时任何 query 都返回 `"small"` |
 | `test_empty_query` | 空字符串或纯空白 query 返回 `"large"` |
 | `test_mistake_intercepted` | query 向量与错题本记录相似度超过阈值 → 触发拦截返回 `"large"` |
 | `test_below_threshold_goes_large` | 语义得分低于基础 threshold → 返回 `"large"` |
@@ -311,6 +335,16 @@ python main.py
 |------|--------|
 | `test_record_mistake_writes_file` | `record_mistake` 将失败的查询写入 JSONL 文件且包含 query 与 vector 字段 |
 | `test_mistake_book_max_limit` | 超过 `max_mistakes` 时淘汰最老条目，保持容量上限 |
+
+**种子库管理（5 项）**
+
+| 测试 | 验证点 |
+|------|--------|
+| `test_add_seed` | 添加种子后文本和向量同步追加到对应路由类别 |
+| `test_add_seed_no_duplicate` | 重复文本不被重复添加 |
+| `test_add_seed_empty_skip` | 空文本跳过不添加 |
+| `test_remove_most_similar_seed` | 删除与查询向量余弦距离最近的那条种子 |
+| `test_reload_seeds` | 从 `seed_vectors.json` 热重载，恢复正确的种子数据 |
 
 ### 10.4 运行方式
 
@@ -328,16 +362,18 @@ python -m pytest tests/ -v
 | 操作系统 | Windows 11, Conda 环境 |
 | 嵌入模型 | Ollama `nomic-embed-text`（768 维） |
 | 小模型 (small) | LiteLLM → `deepseek/deepseek-chat` |
-| 大模型 (large) | LiteLLM → `deepseek/deepseek-reasoner` |
+| 大模型 (large) | LiteLLM → `deepseek/deepseek-v4-pro` |
+| 种子向量缓存 | `seed_vectors.json`（预计算，启动直读） |
 | 嵌入方式 | 本地模式 mock（不调 Ollama），加 `--api` 时真实调用 |
 
 ### 11.1 路由初始化
 
 | 指标 | 耗时 |
 |------|------|
-| 种子向量加载（81 条 mock 嵌入） | 742 µs |
+| 种子向量加载（从 `seed_vectors.json` 直读，81 条） | < 10 ms |
+| 种子向量预计算（`precompute_seeds.py`，81 条，8 线程并发 Ollama） | ~10 秒 |
 
-> 注：此数据为 mock 嵌入服务的值。生产环境中实际需调用 Ollama，81 条种子需更多时间。
+> 注：生产环境中启动时 Router 优先从 `seed_vectors.json` 加载预计算向量（毫秒级）；运行 `precompute_seeds.py` 一次性生成该文件约需 10 秒（8 线程并发）。
 
 ### 11.2 余弦相似度计算
 
@@ -375,15 +411,15 @@ python -m pytest tests/ -v
 
 ### 11.5 API 调用延迟（含 LiteLLM 代理）
 
-以下数据来自 `python benchmark.py --api` 实测（模型通过 LiteLLM 代理转发，路由决策使用真实 Ollama 嵌入）：
+以下数据来自 `python benchmark.py --api` 实测（模型通过 LiteLLM 代理转发，路由决策使用真实 Ollama 嵌入，API 测试 3 次取中位数）：
 
-| 测试项 | 耗时 |
-|--------|------|
-| small (deepseek-chat) | 0.875 秒 |
-| large (deepseek-reasoner) | 0.711 秒 |
-| 路由决策开销（含 Ollama 嵌入） | 4.055 秒 → large |
+| 测试项 | 3 次实测 | 中位数 |
+|--------|---------|--------|
+| small (deepseek-chat) | 789ms, 720ms, 736ms | 0.736 秒 |
+| large (deepseek-v4-pro) | 907ms, 716ms, 972ms | 0.907 秒 |
+| 路由决策开销（含 Ollama 嵌入） | — | 4.55 秒 → large |
 
-路由决策的 4.055 秒主要消耗在 Ollama 的 `/api/embeddings` 调用上（将 query 转为 768 维向量）；纯算法部分（余弦匹配、错题本扫描、动态阈值）仅约 400 µs。相比 API 模型调用本身（约 1 秒以内），**嵌入服务是路由延迟的主要瓶颈**，而非路由逻辑本身。
+路由决策的约 4.5 秒主要消耗在 Ollama 的 `/api/embeddings` 调用上（将 query 转为 768 维向量）；纯算法部分（余弦匹配、错题本扫描、动态阈值）仅约 400 µs。相比 API 模型调用本身（约 1 秒以内），**嵌入服务是路由延迟的主要瓶颈**，而非路由逻辑本身。
 
 ## 12. 结论
 

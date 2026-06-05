@@ -1,11 +1,15 @@
 # 这里实例化所有的模块、定义全局 Tools Schema、注入回调，并运行控制台的主循环。
 
 import json
+import sys
 import uuid
 from config import client, WORKDIR, SKILLS_DIR, TOKEN_THRESHOLD, VALID_MSG_TYPES, ROUTER
 from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens, microcompact, is_tool_error
 from managers import TodoManager, SkillLoader, TaskManager, BackgroundManager, MessageBus
 from team import TeammateManager, run_subagent, auto_compact
+
+# 重配 stdout 编码，防止 UTF-8 内容打印到 GBK 终端时 UnicodeEncodeError
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # === SECTION: global_instances ===
 TODO = TodoManager()
@@ -142,7 +146,8 @@ def is_tool_error(output: str) -> bool:
     return False
 
 # === SECTION: agent_loop ===
-def agent_loop(messages: list, query: str):
+def agent_loop(messages: list, query: str, force_mode: str = ""):
+    """force_mode: "" = 跟随系统, "large" = 强制大模型, "small" = 强制小模型"""
     rounds_without_todo = 0
     while True:
         # s06: compression pipeline
@@ -177,7 +182,11 @@ def agent_loop(messages: list, query: str):
                         break
         
         routing_query = current_subtask if current_subtask else query
-        current_model = ROUTER.route(query=routing_query, total_tokens=current_tokens)
+        current_model = ROUTER.route(
+            query=routing_query, total_tokens=current_tokens,
+            force_large=(force_mode == "large"),
+            force_small=(force_mode == "small"),
+        )
             
 # 路由
         # LLM call
@@ -201,13 +210,38 @@ def agent_loop(messages: list, query: str):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
+                out_str = str(output)
+                # 按工具类型定制显示，避免无差别 dump 内容
+                if block.name == "bash":
+                    print(f"\033[36m> bash:\033[0m")
+                    print(out_str[:200])
+                elif block.name == "read_file":
+                    path = block.input.get("path", "").replace(str(WORKDIR), ".")
+                    lines = out_str.count('\n') if not out_str.startswith("Error:") else 0
+                    if out_str.startswith("Error:"):
+                        print(f"\033[31m> read_file: {out_str[:120]}\033[0m")
+                    else:
+                        print(f"\033[34m> 📄 read_file: {path} ({lines} 行)\033[0m")
+                elif block.name in ("write_file", "edit_file"):
+                    path = block.input.get("path", "").replace(str(WORKDIR), ".")
+                    print(f"\033[32m> ✏️ {block.name}: {path}\033[0m")
+                elif block.name == "TodoWrite":
+                    items = block.input.get("items", [])
+                    summary = ", ".join(f"{i.get('status','?')}:{i.get('content','')[:30]}" for i in items)
+                    print(f"\033[33m> 📋 TodoWrite: {summary[:150]}\033[0m")
+                else:
+                    print(f"> {block.name}:")
+                    print(out_str[:200])
 
                 # 记录错题本
                 if is_tool_error(output) and current_model == "small":
-                    # mistake_context = f"{routing_query} (Failed at: {block.name})"
                     ROUTER.record_mistake(routing_query)
+
+                # 小模型成功但匹配分低 → 把查询加入种子库
+                if not is_tool_error(output) and current_model == "small":
+                    small_score = ROUTER._last_route_scores.get("small", 0.0)
+                    if 0 < small_score < ROUTER.threshold + 0.15:
+                        ROUTER.add_seed(routing_query, "small")
 
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
@@ -248,9 +282,22 @@ if __name__ == "__main__":
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
-        history.append({"role": "user", "content": query})
+        if query.strip() == "/reload":
+            ROUTER.reload_seeds()
+            continue
+        # ── 处理强制模型前缀 ──
+        force_mode = ""
+        if query.startswith("!large "):
+            force_mode = "large"
+            query = query[7:]
+            print(f"\033[33m已强制使用: large\033[0m")
+        elif query.startswith("!small "):
+            force_mode = "small"
+            query = query[7:]
+            print(f"\033[33m已强制使用: small\033[0m")
 
-        agent_loop(history, query)
+        history.append({"role": "user", "content": query})
+        agent_loop(history, query, force_mode=force_mode)
 
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
