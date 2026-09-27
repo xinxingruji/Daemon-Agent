@@ -8,7 +8,9 @@
 为实现这一目标，项目在工程层面实现了轻量语义路由（预计算种子向量并进行在线嵌入匹配）、错题本失败记忆（将小模型的工具执行失败向量化并持久化）、以及基于会话长度的动态阈值惩罚和可配置的模型映射。这样的设计既能显著减少不必要的大模型调用与响应延迟，又通过针对性记忆与动态保守策略，在遇到已知陷阱或长期上下文膨胀时提供自动防护，从而在成本、性能与可靠性之间建立可控且可度量的折中。
 
 主要代码文件：
-- [config.py](config.py)：系统配置与 `Claude_Router` 实例化。
+- [config.py](config.py)：系统路径、环境加载与客户端/Router 惰性初始化。
+- [diagnostics.py](diagnostics.py) / [doctor.py](doctor.py)：只读启动诊断。
+- [seed_cache.py](seed_cache.py)：种子缓存 schema、哈希和一致性校验。
 - [router.py](router.py)：路由器核心逻辑（语义匹配、错题拦截、动态 Token 惩罚）。
 - [main.py](main.py)：主循环、工具集（TOOLS）与 Agent 调度。
 - [team.py](team.py)：Teammate 和 Subagent 管理、上下文压缩逻辑。
@@ -64,7 +66,7 @@
 
 本项目的架构可以概括为“一个主控入口 + 一个语义路由器 + 多类执行单元 + 多种持久化管理器”的组合。系统并不是把所有能力都塞进一个单体循环，而是把职责拆分为若干层：配置层负责环境与目录初始化，路由层负责模型选择，执行层负责工具调用与子智能体协作，管理层负责任务、消息、技能与后台任务，持久化层负责把运行状态落盘，确保系统可以在中断后继续工作。
 
-从运行顺序上看，启动时先由 [config.py](config.py) 读取环境变量并创建全局对象，包括 Anthropic 客户端、工作目录和各类存储目录，同时实例化 `Claude_Router`。随后 [main.py](main.py) 创建 Todo、Skill、Task、Background、MessageBus 和 TeammateManager 等全局管理器，并把这些组件组装进主循环 `agent_loop`。当用户在终端输入任务后，主循环会先压缩历史上下文、再读取后台消息和收件箱、再调用路由器决定本轮使用 `small` 还是 `large`，最后把消息与工具列表一起交给大模型推理。如果模型产生工具调用，主循环会执行对应工具，再把结果回灌给模型，形成典型的 ReAct 闭环。
+从运行顺序上看，[config.py](config.py) 在导入阶段只定义工作目录、运行路径和惰性资源代理，不创建 Anthropic 客户端或 `Claude_Router`。[main.py](main.py) 也把 Todo、Skill、Task、Background、MessageBus 和 TeammateManager 的构造推迟到 `initialize_runtime()`；因此仅导入模块不会访问网络或创建 `.tasks/.team` 目录。真正启动主程序或首次使用模型资源时，系统才加载 `.env`、构造客户端与 Router，并把组件组装进 `agent_loop`。当用户输入任务后，主循环会先压缩历史上下文、读取后台消息和收件箱、调用路由器决定本轮使用 `small` 还是 `large`，最后把消息与工具列表一起交给模型推理。如果模型产生工具调用，主循环会执行对应工具，再把结果回灌给模型，形成 ReAct 闭环。
 
 系统内部的核心数据流是单向推进、局部回写的：用户输入进入消息队列后，先被估算 token，再被路由决策；模型输出若触发工具执行，则通过 [core_tools.py](core_tools.py) 的本地命令与读写函数、[managers.py](managers.py) 的任务/消息/后台管理器、[team.py](team.py) 的子智能体与队友线程进行处理；执行结果会作为 `tool_result` 再次写回 messages。与此同时，任务文件、消息队列、队友配置、转录记录和错题本也会分别落在 `.tasks`、`.team/inbox`、`.team/config.json`、`.transcripts` 和 `mistakes.json` 中，保证系统的状态不是只存在于内存里。
 
@@ -167,17 +169,17 @@ sequenceDiagram
 
 ## 5. 各模块运作原理
 
-### 5.1 `config.py`：运行环境与全局对象初始化
+### 5.1 `config.py`：运行环境与惰性资源初始化
 
-[config.py](config.py) 的实现原则是“先建立可预测的运行边界，再让其他模块共享这套边界”。它通过 `load_dotenv(override=True)` 读取环境变量，并在检测到 `ANTHROPIC_BASE_URL` 时主动清理 `ANTHROPIC_AUTH_TOKEN`，避免本地代理和云端凭证互相冲突。`WORKDIR = Path.cwd()` 之后，所有目录都以当前工作区为根节点派生，包括 `.team`、`.tasks`、`.transcripts`、`skills` 等路径；这保证了文件读写、任务落盘和转录保存都发生在同一个沙箱内。
+[config.py](config.py) 的实现原则是“先建立可预测的运行边界，再按需创建有副作用的资源”。`WORKDIR = Path.cwd()` 之后，所有目录都以当前工作区为根节点派生，包括 `.team`、`.tasks`、`.transcripts`、`skills` 等路径。`.env` 不在模块导入时加载，而是在首次请求客户端或 Router 时由 `load_runtime_env()` 加载；检测到 `ANTHROPIC_BASE_URL` 时仍会清理 `ANTHROPIC_AUTH_TOKEN`，避免本地代理和云端凭证互相冲突。
 
-代码层面的关键点是，这里提前构造了两个全局对象：`Anthropic(base_url=...)` 和 `Claude_Router()`。前者决定了后续所有 `client.messages.create(...)` 调用都走同一条 API 入口，后者则在进程启动时就完成路由种子向量的预计算。换句话说，config 层并不参与业务判断，但它把“连接方式”和“持久化位置”一次性固定下来，后续模块只需要引用这些常量即可。
+代码层面的关键点是 `get_client()` 与 `get_router()`：二者使用锁保护单例创建，只在首次实际访问时构造资源。为兼容现有的 `client` 和 `ROUTER` 导入方式，模块提供 `LazyResource` 代理，把属性访问转发给惰性工厂。`runtime_initialization_status()` 则允许 doctor 和回归测试确认导入阶段没有初始化环境、客户端或 Router。
 
 ### 5.2 `router.py`：语义路由、错题本与动态阈值
 
 [router.py](router.py) 的核心实现是一个三段式决策器：先做错题本拦截，再做语义相似度匹配，最后做 token 惩罚修正。初始化时，类里先写死两组种子短语，分别代表低风险任务和高风险任务，然后对每条种子文本调用本地嵌入接口 `http://localhost:11434/api/embeddings` 生成向量并缓存到 `route_embeddings`。这样做的好处是，运行时只需要对用户 query 计算一次 embedding，后面就可以直接和缓存向量做余弦相似度比对，不必每次都重新构造路由知识库。
 
-为消除每次启动都要逐条调 Ollama 嵌入的启动延迟（82 条种子串行约 80 秒），项目新增了 `precompute_seeds.py` 预处理脚本与 `seed_vectors.json` 向量缓存机制。`precompute_seeds.py` 使用 8 线程并发调用 Ollama 一次性完成所有种子文本的向量化并写入 JSON 文件（实测约 10 秒）；Router 启动时优先读取 `seed_vectors.json`（毫秒级），仅在文件不存在时回退到逐条 Ollama 嵌入的初始化方式并自动写出缓存。种子文本与向量分开存储，`route_embeddings_text` 记录每条向量的原始文本，供运行时动态增删种子使用。
+为消除每次启动都要逐条调 Ollama 嵌入的启动延迟，项目提供 `precompute_seeds.py` 与 `seed_vectors.json` 向量缓存机制。预处理脚本使用 8 线程并发生成当前 81 条种子，只有全部成功且维度一致时才以临时文件替换原缓存，避免失败运行破坏已有数据。版本化缓存由 `seed_cache.py` 生成和校验，元数据包含 schema 版本、embedding 模型、向量维度和内置种子哈希。Router 兼容旧格式缓存并给出升级警告；新版缓存若模型、维度或种子哈希不匹配，会明确提示重新预计算并尝试从 Ollama 重建。
 
 Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新查询文本向量化并追加到指定路由类别（small/large），`reload_seeds()` 支持热重载 `seed_vectors.json` 而无需重启进程。`remove_most_similar_seed(query_vector, route)` 方法仍保留但未被 `main.py` 调用，种子库的剔除由后台异步压缩机制统一管理。`route()` 方法新增 `force_small` 参数（为 True 时直接返回 "small"），同时记录 `_last_query_vector`、`_last_route_scores` 和 `_last_best_route`，供主循环的种子反馈逻辑使用。路由决策核心（错题本 → 语义匹配 → token 惩罚）本身未变。
 
@@ -245,13 +247,13 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 ## 6. 数据流与持久化
 
 - 持久化目录由 [config.py](config.py) 定义，包含 `.team`、`.tasks`、`.transcripts` 等子目录；系统通过这些目录保存运行时状态以便重启恢复。
-- 种子向量缓存文件 `seed_vectors.json`，由 `precompute_seeds.py` 一次性生成（8 线程并发 Ollama，约 10 秒），Router 启动时直接读取（毫秒级）。文件结构为 `{"small": [{"text": "...", "vector": [...]}, ...], "large": [...]}`，文本与向量一一对应，支持运行时动态增删。
+- 种子向量缓存文件 `seed_vectors.json` 由 `precompute_seeds.py` 一次性生成。顶层 `_meta` 记录 schema 版本、embedding 模型、向量维度和 `utterances.py` 源哈希，`small`/`large` 数组保存文本与向量。Router 仍能读取没有 `_meta` 的旧缓存，但会提示重新预计算升级格式。
 - 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加方式；超限时触发后台异步 LLM 压缩浓缩，而非简单的 FIFO 淘汰。
 - 任务与队友配置以 `task_{id}.json`、`.team/config.json` 等 JSON 文件保存在对应子目录。程序启动时会重新读取任务文件和队友元数据，但不会恢复队友线程或对话上下文；这些文件写入目前也没有统一的原子写入、异常记录和恢复机制。
 
 ## 7. 部署与运行
 
-依赖（见 [requirements.txt](requirements.txt)）：`anthropic`, `python-dotenv`, `pyyaml`, `litellm[proxy]`。
+项目使用 Python 3.11 及以上版本。依赖（见 [requirements.txt](requirements.txt)）包括 `anthropic`、`python-dotenv`、`pyyaml`、`litellm[proxy]` 和 `pytest`。
 
 推荐运行步骤：
 1. 安装依赖：
@@ -269,9 +271,11 @@ python precompute_seeds.py
 
 4. 配置 `litellm_config.yaml` 将 `small`/`large` 映射到实际模型。参考 [README.md](README.md) 的示例。
 5. 启动 LiteLLM 代理：`litellm --config litellm_config.yaml --port 4000`。
-6. 设置环境变量（`.env`），然后运行主程序：
+6. 设置环境变量（`.env`），运行只读诊断，再启动主程序：
 
 ```bash
+python doctor.py
+# 或仅检查文件与配置：python doctor.py --offline
 python main.py
 ```
 
@@ -305,7 +309,7 @@ python main.py
 
 [benchmark.py](benchmark.py) 提供本地和 API 两种基准测试模式。详细测试数据见第 11 节。
 
-> **关于路由初始化耗时**：benchmark 本地模式通过 mock 拦截了 `_get_embedding` 调用（直接返回固定向量，不实际访问 Ollama），因此初始化耗时仅 742 µs。生产环境中路由器在启动时需逐条调用 Ollama 的 `/api/embeddings` 接口（使用 `nomic-embed-text` 模型）对种子语句生成 768 维嵌入向量，实际耗时取决于种子数量和网络速度。此外运行时每次 `route()` 调用也需向 Ollama 请求一次 query 向量嵌入，实测约 4 秒。benchmark 的设计意图是只测量路由逻辑本身的纯计算开销，排除外部服务的波动干扰。
+> **关于路由初始化耗时**：benchmark 本地模式通过 mock 拦截 `_get_embedding` 调用（直接返回固定向量，不实际访问 Ollama），因此初始化耗时仅 742 µs。生产环境优先读取已校验的 `seed_vectors.json`；仅在缓存缺失或失效时才逐条调用 Ollama 的 `/api/embeddings` 接口（默认使用 `nomic-embed-text-v2-moe`）重建种子。运行时每次 `route()` 仍需为 query 请求一次 embedding，历史实测约 4 秒。benchmark 的设计意图是只测量路由逻辑本身的纯计算开销，排除外部服务波动。
 
 ## 9. 安全性、鲁棒性与限制
 
@@ -325,13 +329,17 @@ python main.py
 
 ## 10. 测试
 
-测试采用 `pytest` 框架，共收集 34 项。默认执行 32 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过 mock 与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 34 项。
+测试采用 `pytest` 框架，共收集 47 项。默认执行 45 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过 mock、子进程与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 47 项。
 
 ### 10.1 测试文件结构
 
 - [tests/test_utterances.py](tests/test_utterances.py) — 验证种子数据完整性
 - [tests/test_router.py](tests/test_router.py) — 验证路由核心逻辑（17 项，含新增 6 项种子库管理及 `force_small` 测试）
 - [tests/test_benchmarks.py](tests/test_benchmarks.py) — 性能基准测试（13 项，含 API 延迟多次测量与路由准确率模拟）
+- [tests/test_seed_cache.py](tests/test_seed_cache.py) — 验证缓存 schema、旧格式兼容和元数据失配
+- [tests/test_precompute_seeds.py](tests/test_precompute_seeds.py) — 验证预计算失败保护和版本化缓存写入
+- [tests/test_diagnostics.py](tests/test_diagnostics.py) — 验证 doctor 的配置检查与脱敏输出
+- [tests/test_import_side_effects.py](tests/test_import_side_effects.py) — 验证导入模块不初始化运行时或创建目录
 - [tests/conftest.py](tests/conftest.py) — 提供 mock 工具函数，拦截 `_get_embedding`、`_load_mistakes`、`_load_seed_vectors`、`_save_seed_vectors`，避免触发外部服务与文件读写
 
 ### 10.2 种子数据测试（4 项）

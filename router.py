@@ -10,11 +10,19 @@ from typing import List, Dict
 # 必须在任何 print() 之前执行，所以放在 router.py 最顶部
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from utterances import SMALL, LARGE
+from seed_cache import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_URL,
+    build_seed_cache_document,
+    validate_seed_cache,
+)
 
 class Claude_Router:
     def __init__(self, threshold: float = 0.45, mistake_threshold: float = 0.75,
                  mistake_file: str = "mistakes.json", seed_file: str = "seed_vectors.json",
-                 safe_tokens: int = 3000, penalty_step: int = 4000, max_mistakes: int = 200):
+                 safe_tokens: int = 3000, penalty_step: int = 4000, max_mistakes: int = 200,
+                 model_name: str = DEFAULT_EMBEDDING_MODEL,
+                 api_url: str = DEFAULT_EMBEDDING_URL):
         self.threshold = threshold
         self.mistake_threshold = mistake_threshold
         self.mistake_file = mistake_file
@@ -26,8 +34,8 @@ class Claude_Router:
 
         self.max_mistakes = max_mistakes
 
-        self.model_name = "nomic-embed-text-v2-moe"
-        self.api_url = "http://localhost:11434/api/embeddings"
+        self.model_name = model_name
+        self.api_url = api_url
         self._last_alert_query = ""
         self._last_semantic_query = ""
         self._last_intercept_query = ""
@@ -71,6 +79,19 @@ class Claude_Router:
             try:
                 with open(self.seed_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                report = validate_seed_cache(
+                    data,
+                    expected_model=self.model_name,
+                    source_routes=self.routes,
+                )
+                if not report.valid:
+                    details = "; ".join(report.errors)
+                    raise ValueError(
+                        f"种子缓存不匹配: {details}. "
+                        "请运行 python precompute_seeds.py 重新生成",
+                    )
+                for warning in report.warnings:
+                    print(f"[Router 警告] {warning}")
                 for route_name in ("small", "large"):
                     entries = data.get(route_name, [])
                     for entry in entries:
@@ -81,7 +102,7 @@ class Claude_Router:
                 print(f"[Router] 已从 {self.seed_file} 加载种子向量: small={s_cnt}, large={l_cnt}")
                 return
             except Exception as e:
-                print(f"[Router] 读取 {self.seed_file} 失败: {e}，回退到 utterances.py")
+                print(f"[Router] 读取 {self.seed_file} 失败: {e}，尝试从 Ollama 重建")
 
         # 回退：用 utterances.py + Ollama（保留向后兼容）
         total = sum(len(v) for v in self.routes.values())
@@ -97,16 +118,31 @@ class Claude_Router:
                 bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
                 print(f"\r\033[K  [Router] 加载向量: |{bar}| {pct}% ({done}/{total})", end="", flush=True)
         print()
-        # 顺便写出缓存，下次启动就用它
-        self._save_seed_vectors()
+        expected = total
+        loaded = sum(len(items) for items in self.route_embeddings.values())
+        if loaded == expected:
+            # 仅在全部种子成功时写缓存，避免用不完整结果覆盖旧文件。
+            self._save_seed_vectors()
+        else:
+            self.route_embeddings_text = {"small": [], "large": []}
+            self.route_embeddings = {"small": [], "large": []}
+            print(
+                f"[Router 错误] 仅生成 {loaded}/{expected} 条种子向量，"
+                "未写入缓存；自动路由将保守使用 large。",
+            )
 
     def _save_seed_vectors(self):
         """将当前种子向量写入 seed_vectors.json"""
-        data = {"small": [], "large": []}
+        entries = {"small": [], "large": []}
         for route_name in ("small", "large"):
             for i, vec in enumerate(self.route_embeddings[route_name]):
                 text = self.route_embeddings_text[route_name][i]
-                data[route_name].append({"text": text, "vector": vec})
+                entries[route_name].append({"text": text, "vector": vec})
+        data = build_seed_cache_document(
+            entries,
+            embedding_model=self.model_name,
+            source_routes=self.routes,
+        )
         with open(self.seed_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -214,7 +250,8 @@ class Claude_Router:
                 snapshot = self.route_embeddings_text["small"][self.base_small_count:].copy()
 
         def _compress_task():
-            from config import client
+            from config import get_client
+            client = get_client()
             
             try:
                 print(f"\n[Router ⚙️] 启动后台 LLM {target} 压缩机制 (处理 {len(snapshot)} 条数据)...")

@@ -1,7 +1,8 @@
-# 这里实例化所有的模块、定义全局 Tools Schema、注入回调，并运行控制台的主循环。
+# 这里定义运行时组装、全局 Tools Schema、回调和控制台主循环。
 
 import json
 import sys
+import threading
 import uuid
 from config import client, WORKDIR, SKILLS_DIR, TOKEN_THRESHOLD, VALID_MSG_TYPES, ROUTER
 from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens, microcompact, is_tool_error
@@ -12,18 +13,38 @@ from team import TeammateManager, run_subagent, auto_compact
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # === SECTION: global_instances ===
-TODO = TodoManager()
-SKILLS = SkillLoader(SKILLS_DIR)
-TASK_MGR = TaskManager()
-BG = BackgroundManager()
-BUS = MessageBus()
-TEAM = TeammateManager(BUS, TASK_MGR)
+TODO = None
+SKILLS = None
+TASK_MGR = None
+BG = None
+BUS = None
+TEAM = None
 
 # === SECTION: system_prompt ===
-SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+SYSTEM = ""
+_runtime_lock = threading.Lock()
+
+
+def initialize_runtime() -> None:
+    """Initialize stateful managers only when the agent actually starts."""
+    global TODO, SKILLS, TASK_MGR, BG, BUS, TEAM, SYSTEM
+    if TODO is not None:
+        return
+    with _runtime_lock:
+        if TODO is not None:
+            return
+        todo = TodoManager()
+        skills = SkillLoader(SKILLS_DIR)
+        task_mgr = TaskManager()
+        background = BackgroundManager()
+        bus = MessageBus()
+        team = TeammateManager(bus, task_mgr)
+        system = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
 Use task for subagent delegation. Use load_skill for specialized knowledge.
-Skills: {SKILLS.descriptions()}"""
+Skills: {skills.descriptions()}"""
+        TODO, SKILLS, TASK_MGR = todo, skills, task_mgr
+        BG, BUS, TEAM, SYSTEM = background, bus, team, system
 
 # === SECTION: shutdown + plan tracking (s10) ===
 shutdown_requests = {}
@@ -31,6 +52,7 @@ plan_requests = {}
 
 # === SECTION: shutdown_protocol (s10) ===
 def handle_shutdown_request(teammate: str) -> str:
+    initialize_runtime()
     req_id = str(uuid.uuid4())[:8]
     shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
     BUS.send("lead", teammate, "Please shut down.", "shutdown_request", {"request_id": req_id})
@@ -38,6 +60,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 # === SECTION: plan_approval (s10) ===
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    initialize_runtime()
     req = plan_requests.get(request_id)
     if not req: return f"Error: Unknown plan request_id '{request_id}'"
     req["status"] = "approved" if approve else "rejected"
@@ -148,6 +171,7 @@ def is_tool_error(output: str) -> bool:
 # === SECTION: agent_loop ===
 def agent_loop(messages: list, query: str, force_mode: str = ""):
     """force_mode: "" = 跟随系统, "large" = 强制大模型, "small" = 强制小模型"""
+    initialize_runtime()
     rounds_without_todo = 0
     while True:
         # s06: compression pipeline
@@ -260,6 +284,7 @@ def agent_loop(messages: list, query: str, force_mode: str = ""):
 
 # === SECTION: repl ===
 if __name__ == "__main__":
+    initialize_runtime()
     history = []
     while True:
         try:
