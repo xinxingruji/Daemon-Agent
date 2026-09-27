@@ -6,8 +6,9 @@ import sys
 import threading
 import time
 from config import client, WORKDIR, TEAM_DIR, TASKS_DIR, TRANSCRIPT_DIR, ROUTER, POLL_INTERVAL, IDLE_TIMEOUT
-from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens, is_tool_error
+from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens
 from managers import MessageBus, TaskManager
+from tool_result import ErrorKind, ToolResult, ensure_tool_result
 
 # 重配 stdout 编码，防止 UTF-8 内容打印到 GBK 终端时 UnicodeEncodeError
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -29,10 +30,34 @@ def auto_compact(messages: list) -> list:
         {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
     ]
 
+def _invoke_agent_tool(name: str, arguments: dict, requester: str) -> ToolResult:
+    dispatch = {
+        "bash": lambda **kw: run_bash(kw["command"], requester=requester),
+        "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    }
+    handler = dispatch.get(name)
+    if handler is None:
+        return ToolResult.failure(f"Unknown tool: {name}", error_kind=ErrorKind.MODEL)
+    try:
+        return ensure_tool_result(handler(**arguments))
+    except (KeyError, TypeError, ValueError) as exc:
+        return ToolResult.failure(
+            f"Invalid arguments for {name}: {exc}",
+            error_kind=ErrorKind.MODEL,
+        )
+    except Exception as exc:
+        return ToolResult.failure(
+            f"Tool {name} failed internally: {exc}",
+            error_kind=ErrorKind.INTERNAL,
+        )
+
+
 # === SECTION: subagent (s04) ===
-def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
+def run_subagent(prompt: str, agent_type: str = "Explore") -> ToolResult:
     sub_tools = [
-        {"name": "bash", "description": "Run command.",
+        {"name": "bash", "description": "Run a direct command; high-risk operations require human approval.",
          "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
         {"name": "read_file", "description": "Read file.",
          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
@@ -44,12 +69,6 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
             {"name": "edit_file", "description": "Edit file.",
              "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
         ]
-    sub_handlers = {
-        "bash": lambda **kw: run_bash(kw["command"]),
-        "read_file": lambda **kw: run_read(kw["path"]),
-        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    }
     sub_msgs = [{"role": "user", "content": prompt}]
     resp = None
     for _ in range(30):
@@ -65,19 +84,22 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
         results = []
         for b in resp.content:
             if b.type == "tool_use":
-                h = sub_handlers.get(b.name, lambda **kw: "Unknown tool")
-
-                # 错题本机制
-                output = h(**b.input)
-                if is_tool_error(output) and current_model == "small":
-                    # mistake_context = f"{prompt} (Failed at: {b.name})"
+                output = _invoke_agent_tool(b.name, b.input, f"subagent:{agent_type}")
+                if output.should_record_mistake and current_model == "small":
                     ROUTER.record_mistake(prompt)
 
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(output)[:50000]})
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": b.id,
+                    "content": output.to_model_content()[:50000],
+                })
         sub_msgs.append({"role": "user", "content": results})
     if resp:
-        return "".join(b.text for b in resp.content if hasattr(b, "text")) or "(no summary)"
-    return "(subagent failed)"
+        summary = "".join(b.text for b in resp.content if hasattr(b, "text"))
+        if summary:
+            return ToolResult.success(summary, exit_code=None)
+        return ToolResult.failure("Subagent returned no summary", error_kind=ErrorKind.TOOL)
+    return ToolResult.failure("Subagent failed to produce a response", error_kind=ErrorKind.ENVIRONMENT)
 
 # === SECTION: team (s09/s11) ===
 class TeammateManager:
@@ -102,11 +124,14 @@ class TeammateManager:
             if m["name"] == name: return m
         return None
 
-    def spawn(self, name: str, role: str, prompt: str) -> str:
+    def spawn(self, name: str, role: str, prompt: str) -> ToolResult:
         member = self._find(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
-                return f"Error: '{name}' is currently {member['status']}"
+                return ToolResult.failure(
+                    f"'{name}' is currently {member['status']}",
+                    error_kind=ErrorKind.TOOL,
+                )
             member["status"] = "working"
             member["role"] = role
         else:
@@ -114,7 +139,7 @@ class TeammateManager:
             self.config["members"].append(member)
         self._save()
         threading.Thread(target=self._loop, args=(name, role, prompt), daemon=True).start()
-        return f"Spawned '{name}' (role: {role})"
+        return ToolResult.success(f"Spawned '{name}' (role: {role})", exit_code=None)
 
     def _set_status(self, name: str, status: str):
         member = self._find(name)
@@ -128,7 +153,7 @@ class TeammateManager:
                       f"Use idle when done with current work. You may auto-claim tasks.")
         messages = [{"role": "user", "content": prompt}]
         tools = [
-            {"name": "bash", "description": "Run command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+            {"name": "bash", "description": "Run a direct command; high-risk operations require human approval.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
             {"name": "read_file", "description": "Read file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
             {"name": "write_file", "description": "Write file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
             {"name": "edit_file", "description": "Edit file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
@@ -187,20 +212,35 @@ class TeammateManager:
                 idle_requested = False
                 for block in response.content:
                     if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase."
-                        elif block.name == "claim_task":
-                            output = self.task_mgr.claim(block.input["task_id"], name)
-                        elif block.name == "send_message":
-                            output = self.bus.send(name, block.input["to"], block.input["content"])
-                        else:
-                            dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
-                                        "read_file": lambda **kw: run_read(kw["path"]),
-                                        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-                                        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
-                            output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
-                        out_str = str(output)
+                        try:
+                            if block.name == "idle":
+                                idle_requested = True
+                                output = ToolResult.success("Entering idle phase.", exit_code=None)
+                            elif block.name == "claim_task":
+                                output = ensure_tool_result(
+                                    self.task_mgr.claim(block.input["task_id"], name)
+                                )
+                            elif block.name == "send_message":
+                                output = ensure_tool_result(
+                                    self.bus.send(name, block.input["to"], block.input["content"])
+                                )
+                            else:
+                                output = _invoke_agent_tool(
+                                    block.name,
+                                    block.input,
+                                    f"teammate:{name}",
+                                )
+                        except (KeyError, TypeError, ValueError) as exc:
+                            output = ToolResult.failure(
+                                f"Invalid arguments for {block.name}: {exc}",
+                                error_kind=ErrorKind.MODEL,
+                            )
+                        except Exception as exc:
+                            output = ToolResult.failure(
+                                f"Tool {block.name} failed internally: {exc}",
+                                error_kind=ErrorKind.INTERNAL,
+                            )
+                        out_str = output.content
                         # 按工具类型定制显示，和 main.py 保持一致的风格
                         path = ""
                         if hasattr(block, 'input') and 'path' in block.input:
@@ -209,8 +249,8 @@ class TeammateManager:
                             print(f"  \033[36m[{name}] > bash:\033[0m")
                             print(f"  {out_str[:120]}")
                         elif block.name == "read_file":
-                            lines = out_str.count('\n') if not out_str.startswith("Error:") else 0
-                            if out_str.startswith("Error:"):
+                            lines = out_str.count('\n') if output.ok else 0
+                            if not output.ok:
                                 print(f"  \033[31m[{name}] ⚠ read_file: {out_str[:120]}\033[0m")
                             else:
                                 print(f"  \033[34m[{name}] 📄 read_file: {path} ({lines} 行)\033[0m")
@@ -220,11 +260,14 @@ class TeammateManager:
                             print(f"  \033[33m[{name}] 🔧 {block.name}: {out_str[:120]}\033[0m")
 
                         # 错题本机制
-                        if is_tool_error(output) and current_model == "small":
-                            # mistake_context = f"{current_mission} (Failed at: {block.name})"
+                        if output.should_record_mistake and current_model == "small":
                             ROUTER.record_mistake(current_mission)
-                        
-                        results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": output.to_model_content(),
+                        })
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
                     break

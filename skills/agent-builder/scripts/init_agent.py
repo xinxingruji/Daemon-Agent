@@ -30,6 +30,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 import subprocess
 import os
+import shlex
 
 load_dotenv()
 
@@ -63,7 +64,8 @@ def run(prompt, history=[]):
             if b.type == "tool_use":
                 print(f"> {{b.input['command']}}")
                 try:
-                    out = subprocess.run(b.input["command"], shell=True, capture_output=True, text=True, timeout=60)
+                    argv = shlex.split(b.input["command"], posix=os.name != "nt")
+                    out = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=60)
                     output = (out.stdout + out.stderr).strip() or "(empty)"
                 except Exception as e:
                     output = f"Error: {{e}}"
@@ -90,6 +92,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import subprocess
 import os
+import shlex
 
 load_dotenv()
 
@@ -133,7 +136,8 @@ def execute(name: str, args: dict) -> str:
         if any(d in args["command"] for d in dangerous):
             return "Error: Dangerous command blocked"
         try:
-            r = subprocess.run(args["command"], shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=60)
+            argv = shlex.split(args["command"], posix=os.name != "nt")
+            r = subprocess.run(argv, shell=False, cwd=WORKDIR, capture_output=True, text=True, timeout=60)
             return (r.stdout + r.stderr).strip()[:50000] or "(empty)"
         except subprocess.TimeoutExpired:
             return "Error: Timeout (60s)"

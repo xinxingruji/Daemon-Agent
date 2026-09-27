@@ -7,6 +7,8 @@ Each tool needs:
 """
 
 from pathlib import Path
+import os
+import shlex
 import subprocess
 
 WORKDIR = Path.cwd()
@@ -163,9 +165,10 @@ def run_bash(command: str) -> str:
         return "Error: Dangerous command blocked"
 
     try:
+        argv = shlex.split(command, posix=os.name != "nt")
         result = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=False,
             cwd=WORKDIR,
             capture_output=True,
             text=True,

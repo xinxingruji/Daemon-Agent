@@ -149,6 +149,16 @@ python main.py
 
 进入 `Daemon >>` 终端后，输入你的任务。支持 `!large` / `!small` 前缀强制指定模型，`/reload` 热重载种子库。
 
+命令工具默认以参数数组执行，不启用隐式 shell。管道、重定向、删除、网络访问、依赖安装和 Git 远端操作等高风险命令会返回一次性审批编号，不会立即执行。可使用：
+
+```text
+/approvals
+/approve <request-id>
+/deny <request-id>
+```
+
+审批只能由终端用户完成，模型不能批准自己的命令。Agent 文件工具也会阻止直接访问 `.env`、真实 `litellm_config.yaml` 和 `.git`；请通过人工编辑或受控 Git 命令管理这些文件。
+
 ---
 
 ## 6. 测试
@@ -161,7 +171,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-共收集 47 项测试。默认运行其中 45 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 47 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock、子进程和临时目录隔离外部依赖。
+共收集 67 项测试。默认运行其中 65 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 67 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock、子进程和临时目录隔离外部依赖。
 
 **测试内容：**
 
@@ -177,6 +187,7 @@ python -m pytest tests/ -v
 | 缓存预计算 | [tests/test_precompute_seeds.py](tests/test_precompute_seeds.py) | 2 | 部分失败不覆盖旧缓存、成功生成版本化缓存 |
 | 启动诊断 | [tests/test_diagnostics.py](tests/test_diagnostics.py) | 4 | 模型映射、缓存诊断、URL 与密钥脱敏 |
 | 导入副作用 | [tests/test_import_side_effects.py](tests/test_import_side_effects.py) | 1 | 导入 config/main 不初始化运行时或创建目录 |
+| 工具安全边界 | [tests/test_tool_safety.py](tests/test_tool_safety.py) | 20 | 结构化结果、一次性审批、无隐式 shell、环境隔离、保护路径与原子写入 |
 
 **运行环境要求：**
 - 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）

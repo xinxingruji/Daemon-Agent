@@ -1,108 +1,119 @@
 # 存放纯粹的执行逻辑，不依赖于任何复杂的 Agent 状态。
 
-import subprocess
 import json
-import sys
+import os
 from pathlib import Path
+import stat
+import tempfile
+
+from command_executor import CommandExecutor
 from config import WORKDIR
+from tool_result import ErrorKind, ToolResult
+
+
+COMMAND_EXECUTOR = CommandExecutor(WORKDIR)
 
 # === SECTION: base_tools ===
+def get_command_executor() -> CommandExecutor:
+    return COMMAND_EXECUTOR
+
+
 def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
+    root = WORKDIR.resolve()
+    path = (root / p).resolve()
+    if not path.is_relative_to(root):
+        raise PermissionError(f"Path escapes workspace: {p}")
+    relative_parts = tuple(part.lower() for part in path.relative_to(root).parts)
+    if ".git" in relative_parts:
+        raise PermissionError("Direct access to .git is blocked; use approved Git commands")
+    if relative_parts:
+        filename = relative_parts[-1]
+        if filename == "litellm_config.yaml":
+            raise PermissionError("Direct access to the real LiteLLM configuration is blocked")
+        if filename == ".env" or (
+            filename.startswith(".env.") and filename != ".env.example"
+        ):
+            raise PermissionError("Direct access to runtime environment files is blocked")
     return path
 
-# run_bash返回命令行的输出以及退出码returncode，如果returncode不为0则表示出错
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
-    # Windows 上自动转换常见 Unix 命令，避免模型习惯性写 ls / pwd 时报错
-    if sys.platform == "win32":
-        unix_to_win = {
-            "ls": "dir", "ls -l": "dir", "ls -la": "dir /a",
-            "ls -lh": "dir", "ls -lha": "dir /a", "ls -al": "dir /a",
-            "pwd": "cd", "cat": "type", "clear": "cls",
-        }
-        cmd_stripped = command.strip()
-        if cmd_stripped in unix_to_win:
-            command = unix_to_win[cmd_stripped]
-    # 检测疑似文件内容被错误地当作命令执行
-    # 超长内容且无 shell 操作符 → 很可能是文件内容而不是命令
-    SHELL_OPERATORS = (";", "|", "&&", "||", "`", "$(", ">", "<")
-    if len(command) > 500 and not any(op in command for op in SHELL_OPERATORS):
-        return ("Error: 输入内容过长且不含 shell 操作符，看起来像是文件内容被误当作命令执行。"
-                "如想读取文件请使用 read_file 工具。")
+def run_bash(command: str, timeout: int = 120, requester: str = "agent") -> ToolResult:
+    return COMMAND_EXECUTOR.execute(command, timeout=timeout, requester=requester)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    temporary_name = None
     try:
-        # 先以二进制模式捕获输出，手动解码
-        # 先试 UTF-8（API/网页内容多是 UTF-8），失败再回退到系统编码（GBK，系统消息）
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, timeout=120)
-        out_bytes = r.stdout + r.stderr
-        out = ""
-        for enc in ['utf-8', 'gbk']:
-            try:
-                out = out_bytes.decode(enc).strip()
-                break
-            except UnicodeDecodeError:
-                continue
-        if not out:
-            out = out_bytes.decode('utf-8', errors='replace').strip()
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if previous_mode is not None:
+            os.chmod(temporary_name, previous_mode)
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
 
-        if r.returncode != 0:
-            # 1. 提取命令的基础名 (去掉参数)
-            # 例如 "grep -r 'todo' ." -> "grep"
-            base_cmd = command.strip().split()[0] if command.strip() else ""
 
-            # 2. 定义豁免规则：
-            # grep 找不到内容时返回 1
-            # diff 发现差异时返回 1
-            if r.returncode == 1 and base_cmd in ("grep", "diff", "cmp"):
-                # 这是正常探测结果，不视为 Error
-                return out[:50000] if out else "(no matches / differences found)"
+def _file_failure(exc: Exception) -> ToolResult:
+    kind = ErrorKind.PERMISSION if isinstance(exc, PermissionError) else ErrorKind.TOOL
+    return ToolResult.failure(str(exc), error_kind=kind)
 
-            # 3. 其他非 0 退出码，老老实实打上 Error 标签
-            return f"Error: Bash exit code {r.returncode}\n{out}"
 
-        return out[:50000] if out else "(no output)"
-
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-    except (UnicodeDecodeError, UnicodeError) as e:
-        return f"Error: 编码解码失败 - {e}"
-
-def run_read(path: str, limit: int = None) -> str:
+def run_read(path: str, limit: int = None) -> ToolResult:
+    if not isinstance(path, str) or not path.strip():
+        return ToolResult.failure("Path must be a non-empty string", error_kind=ErrorKind.MODEL)
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        return ToolResult.failure("Limit must be a positive integer", error_kind=ErrorKind.MODEL)
     try:
-        # 显式指定 UTF-8 编码，避免中文 Windows 默认用 GBK 解码 UTF-8 文件时崩溃
         lines = safe_path(path).read_text(encoding='utf-8').splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        return ToolResult.success("\n".join(lines)[:50000], exit_code=None)
     except Exception as e:
-        return f"Error: {e}"
+        return _file_failure(e)
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str) -> ToolResult:
+    if not isinstance(path, str) or not path.strip():
+        return ToolResult.failure("Path must be a non-empty string", error_kind=ErrorKind.MODEL)
+    if not isinstance(content, str):
+        return ToolResult.failure("Content must be a string", error_kind=ErrorKind.MODEL)
     try:
         fp = safe_path(path)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        # 显式指定 UTF-8 编码，避免中文 Windows 默认用 GBK 写入时丢字符或崩溃
-        fp.write_text(content, encoding='utf-8')
-        return f"Wrote {len(content)} bytes to {path}"
+        _atomic_write_text(fp, content)
+        byte_count = len(content.encode("utf-8"))
+        return ToolResult.success(f"Wrote {byte_count} bytes to {path}", exit_code=None)
     except Exception as e:
-        return f"Error: {e}"
+        return _file_failure(e)
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def run_edit(path: str, old_text: str, new_text: str) -> ToolResult:
+    if not isinstance(path, str) or not path.strip():
+        return ToolResult.failure("Path must be a non-empty string", error_kind=ErrorKind.MODEL)
+    if not isinstance(old_text, str) or not isinstance(new_text, str):
+        return ToolResult.failure("old_text and new_text must be strings", error_kind=ErrorKind.MODEL)
+    if not old_text:
+        return ToolResult.failure("old_text must not be empty", error_kind=ErrorKind.MODEL)
     try:
         fp = safe_path(path)
-        # 显式指定 UTF-8 编码，与 run_read / run_write 保持一致
         c = fp.read_text(encoding='utf-8')
         if old_text not in c:
-            return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1), encoding='utf-8')
-        return f"Edited {path}"
+            return ToolResult.failure(f"Text not found in {path}", error_kind=ErrorKind.TOOL)
+        _atomic_write_text(fp, c.replace(old_text, new_text, 1))
+        return ToolResult.success(f"Edited {path}", exit_code=None)
     except Exception as e:
-        return f"Error: {e}"
+        return _file_failure(e)
 
 # === SECTION: compression (s06) ===
 def estimate_tokens(messages: list) -> int:
@@ -121,26 +132,9 @@ def microcompact(messages: list):
         if isinstance(part.get("content"), str) and len(part["content"]) > 100:
             part["content"] = "[cleared]"
 
-def is_tool_error(output: str) -> bool:
-    out_str = str(output).strip()
-    # 这是针对run_bash的，如果返回码非0，那一定出错了
-    # 绝对确定的系统级错误前缀 
-    error_prefixes = (
-        "Error:", 
-        "error:", 
-        "ERROR:",
-        "Unknown",        # 捕获 "Unknown tool: xxx"
-        "KeyError",       # 防御性捕获
-        "Exception",      # 防御性捕获
-        "Traceback",      # 捕获未格式化的 Python 崩溃堆栈
-        "Fatal:",         # 捕获一些底层库的致命错误
-        "Trace/BPT trap"  # 捕获 C 级别底层崩溃
-    )
-    if out_str.startswith(error_prefixes):
-        return True
-        
-    # 特定工具的隐式失败标志
-    if out_str in ("(subagent failed)", "Unknown tool", "(no summary)"):
-        return True
-        
-    return False
+def is_tool_error(output: object) -> bool:
+    return isinstance(output, ToolResult) and not output.ok
+
+
+def should_record_mistake(output: object) -> bool:
+    return isinstance(output, ToolResult) and output.should_record_mistake

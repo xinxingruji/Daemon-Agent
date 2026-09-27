@@ -15,6 +15,7 @@ from anthropic import Anthropic
 from pathlib import Path
 import subprocess
 import os
+import shlex
 
 # Configuration
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -68,8 +69,9 @@ def execute_tool(name: str, args: dict) -> str:
     """Execute a tool and return result."""
     if name == "bash":
         try:
+            argv = shlex.split(args["command"], posix=os.name != "nt")
             r = subprocess.run(
-                args["command"], shell=True, cwd=WORKDIR,
+                argv, shell=False, cwd=WORKDIR,
                 capture_output=True, text=True, timeout=60
             )
             return (r.stdout + r.stderr).strip() or "(empty)"
