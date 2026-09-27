@@ -191,8 +191,9 @@ class TestApiLatency:
         print(f"\n  [large] 3 次: {', '.join(format_time(t) for t in times)}")
         print(f"  [large] 中位数: {format_time(median)}")
 
-    def test_routing_overhead_in_real_call(self):
-        """路由器 + API 调用整体耗时（路由器开销 vs API 开销）"""
+class TestRoutingOverheadBenchmark:
+    def test_routing_overhead_with_mock_embedding(self):
+        """使用 mock embedding 测量纯路由逻辑耗时。"""
         r = make_router()
 
         # 路由器开销
@@ -202,7 +203,7 @@ class TestApiLatency:
         route_cost = t1 - t0
 
         print(f"\n  [路由决策] {decision}，决策耗时: {format_time(route_cost)}")
-        print(f"  [说明] 路由决策在毫秒级，实际瓶颈在 API 调用而非路由逻辑")
+        print("  [说明] 本测试使用 mock embedding，不包含 Ollama 或模型 API 延迟")
 
 
 # ══════════════════════════════════════════════════════════

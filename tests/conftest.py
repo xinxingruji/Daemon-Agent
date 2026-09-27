@@ -6,10 +6,6 @@ from router import Claude_Router
 
 
 def pytest_addoption(parser):
-<<<<<<< Updated upstream
-    parser.addoption("--run-api", action="store_true", default=False,
-                     help="Run API latency tests (requires LiteLLM)")
-=======
     parser.addoption(
         "--run-api", action="store_true", default=False,
         help="包含需要 LiteLLM 代理在线的测试",
@@ -28,7 +24,6 @@ def _fake_load_seeds(self):
         "small": [f"seed_s{i}" for i in range(5)],
         "large": [f"seed_l{i}" for i in range(3)],
     }
->>>>>>> Stashed changes
 
 
 def make_router(**kwargs):

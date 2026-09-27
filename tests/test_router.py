@@ -82,22 +82,29 @@ class TestMistakeRecording:
             assert record["query"] == "翻车了"
             assert "vector" in record
 
-    def test_mistake_book_max_limit(self):
-        """错题本超过 max_mistakes 应淘汰最老条目"""
+    def test_mistake_book_triggers_compression_at_limit(self):
+        """错题本达到 max_mistakes 后应触发一次后台压缩。"""
         with tempfile.TemporaryDirectory() as tmpdir:
             mistake_file = os.path.join(tmpdir, "mistakes.json")
             r = make_router(mistake_file=mistake_file, max_mistakes=3)
             r.mistake_book = []
 
-            with patch.object(r, "_get_embedding", return_value=[1.0, 0.0, 0.0]):
+            def mark_compressing(target):
+                assert target == "mistake"
+                r.is_compressing_mistakes = True
+
+            with patch.object(r, "_get_embedding", return_value=[1.0, 0.0, 0.0]), \
+                    patch.object(r, "_trigger_compression_async",
+                                 side_effect=mark_compressing) as trigger:
                 r.record_mistake("q1")
                 r.record_mistake("q2")
                 r.record_mistake("q3")
                 r.record_mistake("q4")
 
-            assert len(r.mistake_book) == 3
-            assert r.mistake_book[0]["query"] == "q2"
-            assert r.mistake_book[-1]["query"] == "q4"
+            trigger.assert_called_once_with(target="mistake")
+            assert [item["query"] for item in r.mistake_book] == [
+                "q1", "q2", "q3", "q4",
+            ]
 
 
 class TestSeedManagement:

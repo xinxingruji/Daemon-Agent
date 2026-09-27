@@ -40,7 +40,7 @@
 
 - 错题本（mistake book）（[router.py](router.py) 的 `record_mistake` 与 `_load_mistakes`）
     - 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
-    - 实现要点：当小模型执行工具失败时，将其 Query 向量化并记入错题本。相比传统的 FIFO 淘汰，系统创新性地实现了后台异步 LLM 压缩机制：当错题满载时，大模型在后台将 200 条具体报错浓缩为 10-20 条涵盖核心难点的通用拦截指令，并通过双重可重入锁（RLock）与快照切片算法无缝覆写内存，主循环零阻塞。
+    - 实现要点：当小模型执行工具失败时，将其 Query 向量化并记入错题本。相比传统的 FIFO 淘汰，系统实现了后台异步 LLM 压缩机制：当错题满载时，大模型在后台将 200 条具体报错浓缩为 10-20 条涵盖核心难点的通用拦截指令，并通过可重入锁（RLock）与快照切片算法写回内存。主循环不等待大模型压缩请求，但写回阶段仍会短暂获取锁。
     - 意义：提高系统可靠性与任务成功率，减少由于重复错误导致的人工干预与系统回滚成本；使得升级模型的触发更具针对性而非盲目升阶。
 
 - 动态 Token 惩罚与长期上下文衰减（[router.py](router.py) 参数与逻辑）
@@ -68,7 +68,7 @@
 
 系统内部的核心数据流是单向推进、局部回写的：用户输入进入消息队列后，先被估算 token，再被路由决策；模型输出若触发工具执行，则通过 [core_tools.py](core_tools.py) 的本地命令与读写函数、[managers.py](managers.py) 的任务/消息/后台管理器、[team.py](team.py) 的子智能体与队友线程进行处理；执行结果会作为 `tool_result` 再次写回 messages。与此同时，任务文件、消息队列、队友配置、转录记录和错题本也会分别落在 `.tasks`、`.team/inbox`、`.team/config.json`、`.transcripts` 和 `mistakes.json` 中，保证系统的状态不是只存在于内存里。
 
-整体模块关系如下（虚线表示后台异步路径，实线表示主循环同步路径）：
+整体模块关系如下（虚线表示后台压缩路径，实线表示主循环同步路径）：
 
 ```mermaid
 flowchart TD
@@ -88,7 +88,7 @@ flowchart TD
     T --> M
 
     %% 种子库动态增强回路（主循环同步路径）
-    T -.->|小模型成功得分低| FB[add_seed 正向增强]
+    T -->|小模型成功得分低| FB[add_seed 正向增强]
     FB --> R
 
     %% 后台异步压缩线程
@@ -105,7 +105,7 @@ flowchart TD
     S3 --> D
 ```
 
-上图中，**实线箭头**表示主循环同步路径——每轮 ReAct 闭环的关键节点（路由决策、模型调用、工具执行、结果回灌）都经此推进；**虚线箭头**则代表两条后台异步路径：一条是工具执行后若小模型成功但得分较低，通过 `add_seed` 将查询文本动态注入种子库（种子库动态增强回路）；另一条是当错题本或动态种子超限时，Router 在后台守护线程中唤醒大模型做知识蒸馏压缩，压缩后的快照通过切片合并算法无缝写回内存。两条异步路径均不阻塞主循环。
+上图中，**实线箭头**表示主循环同步路径——每轮 ReAct 闭环的关键节点（路由决策、模型调用、工具执行、结果回灌）都经此推进。工具执行后若小模型成功但得分较低，`add_seed` 会在主循环内同步请求 embedding 并写入种子缓存，因此该反馈可能增加当前轮次延迟。**虚线箭头**仅表示后台压缩路径：当错题本或动态种子超限时，Router 在守护线程中调用大模型做知识蒸馏压缩，主循环不等待该模型请求；压缩结果写回时仍会短暂获取相应锁。
 
 
 
@@ -206,11 +206,11 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 
 此外，REPL 支持在查询前加模型强制前缀：`!large 查询内容` 跳过路由强制使用大模型，`!small 查询内容` 强制使用小模型；不加前缀则正常走三阶段路由。
 
-### 5.4 `core_tools.py`：安全的本地执行层
+### 5.4 `core_tools.py`：带有限防护的本地执行层
 
 [core_tools.py](core_tools.py) 的实现原则是“只做可控的本地执行，不做开放式系统调用”。`safe_path(p)` 先把相对路径拼到 `WORKDIR` 下，再调用 `resolve()`，最后用 `is_relative_to(WORKDIR)` 校验路径没有逃逸工作区；这一步直接把工具读写限制在项目目录里，避免越权访问。
 
-`run_bash(command)` 的逻辑也比较明确。它先做危险字符串黑名单过滤，只要命中 `rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/` 这类模式就直接返回错误文本，不再调用子进程。对于普通命令，则使用 `subprocess.run(..., shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)` 执行，并把 stdout 和 stderr 合并。若返回码不为 0，会额外区分探测型命令：`grep`、`diff`、`cmp` 返回码为 1 时视为正常探测结果，而不是错误；其他非 0 情况统一包装成 `Error: Bash exit code ...`。这等于把“探测失败”和“真正执行失败”区分开来，减少误报。
+`run_bash(command)` 会先做危险字符串黑名单过滤，只要命中 `rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/` 这类模式就直接返回错误文本，不再调用子进程。对于其他命令，它使用 `subprocess.run(..., shell=True, cwd=WORKDIR, capture_output=True, timeout=120)` 执行，将 stdout 与 stderr 的字节内容合并后优先按 UTF-8、再按 GBK 解码。若返回码不为 0，会额外区分探测型命令：`grep`、`diff`、`cmp` 返回码为 1 时视为正常探测结果，而不是错误；其他非 0 情况统一包装成 `Error: Bash exit code ...`。该实现提供了基础误操作防护，但由于仍使用 `shell=True` 且黑名单覆盖有限，不能视为完整的命令沙箱。
 
 `run_read`、`run_write`、`run_edit` 分别对应读取、创建/覆盖写入和单次替换写入。它们都通过 `safe_path` 获得目标路径，然后做 `read_text()`、`write_text()` 或字符串替换，最后返回可读文本结果。`estimate_tokens(messages)` 不是真实 tokenizer，而是用 `len(json.dumps(messages, default=str)) // 4` 做粗估，因此它属于轻量控制阈值，不追求绝对精度。`microcompact(messages)` 则遍历 messages，找到历史里所有 `tool_result`，只对过长内容做就地裁剪为 `[cleared]`，保留结构但压缩体积。`is_tool_error` 则负责统一错误前缀判断，供主循环和子智能体复用。
 
@@ -222,7 +222,7 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 
 `TaskManager` 使用文件系统作为任务数据库。`create(subject, description)` 会先通过扫描 `task_*.json` 计算下一个 id，再把任务写成 JSON 文件；`get` 读取单个任务文件；`update` 负责维护状态、依赖和删除逻辑。这里最关键的逻辑是依赖关系：当某个任务完成时，代码会遍历所有 task 文件，检查是否有其他任务的 blockedBy 包含当前任务 id，如果有就移除该依赖。这样一来，任务完成会自动解锁后续任务，避免人工同步依赖状态。
 
-`BackgroundManager` 的实现是典型的线程加队列模型。`run(command, timeout)` 会先分配一个 UUID 作为任务 id，把任务状态写入内存字典，然后启动 daemon 线程执行 `_exec`。`_exec` 内部用 `subprocess.run(..., shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=timeout)` 运行命令，并把结果截断后写入 `self.tasks` 和 `notifications` 队列。主线程通过 `drain()` 一次性取走通知，因此后台任务不会阻塞主对话循环。
+`BackgroundManager` 的实现是典型的线程加队列模型。`run(command, timeout)` 会先分配一个 UUID 作为任务 id，把任务状态写入内存字典，然后启动 daemon 线程执行 `_exec`。`_exec` 内部用 `subprocess.run(..., shell=True, cwd=WORKDIR, capture_output=True, timeout=timeout)` 运行命令，并采用与前台相似的 UTF-8/GBK 字节解码策略，再把结果截断后写入 `self.tasks` 和 `notifications` 队列。主线程通过 `drain()` 一次性取走通知，因此后台任务不会阻塞主对话循环；但后台实现目前没有复用 `run_bash` 的危险字符串过滤。
 
 `MessageBus` 则是基于 inbox 文件的轻量消息总线。`send` 不是把消息放入数据库，而是直接把 JSON 序列化后 append 到对应接收者的 JSONL 文件；`read_inbox(name)` 读取整份文件，解析完后立即清空，这相当于实现了“消费即删除”的收件箱语义。`broadcast` 只是对所有队友名字循环调用 `send`，因此它的复杂度完全由队友数量决定，逻辑非常直接。
 
@@ -232,7 +232,7 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 
 `run_subagent(prompt, agent_type)` 是一个短生命周期执行器。它先根据 agent_type 构造工具集合，默认只开放 bash 和 read_file；如果不是 Explore，还会额外开放写文件和编辑文件。然后它创建一段只包含用户 prompt 的消息序列，在最多 30 轮里反复调用模型、执行工具、回灌结果。每一轮都会先用 ROUTER.route(query=prompt, total_tokens=...) 决定用 small 还是 large，这意味着子智能体也继承了同一套语义路由策略。若某次工具输出被判定为错误且当前模型是 small，就立刻把 prompt 和失败工具名写入错题本，确保子智能体踩过的坑会被全局记住。
 
-`TeammateManager` 则是持久化协作的核心。`spawn(name, role, prompt)` 会先检查同名队友是否已经存在，如果存在且状态不是 idle 或 shutdown，就直接拒绝重复启动；如果可以复用，就更新角色并把状态改成 working。随后它启动一个后台线程执行 `_loop(name, role, prompt)`，让队友独立运行。这个设计的重点不是并发数量，而是队友状态可恢复：配置文件保存在 .team/config.json 中，因此即使主进程退出，队友列表和状态仍然可以在下次启动时恢复。
+`TeammateManager` 则是持久化协作的核心。`spawn(name, role, prompt)` 会先检查同名队友是否已经存在，如果存在且状态不是 idle 或 shutdown，就直接拒绝重复启动；如果可以复用，就更新角色并把状态改成 working。随后它启动一个后台线程执行 `_loop(name, role, prompt)`，让队友独立运行。配置文件保存在 `.team/config.json` 中，因此下次启动时可以重新读取队友列表和最后记录的状态；当前实现不会自动恢复已经终止的线程、对话上下文或执行现场。
 
 在 `_loop` 内部，队友的行为是一个“工作阶段 + 空闲阶段”的循环。工作阶段里，线程先轮询自己的 inbox，读到 shutdown_request 就立即退出；如果收到普通消息，就把消息包装成 `<inbox>...</inbox>` 形式追加到上下文。随后它会从最近的消息里提炼 mission：如果遇到 `<auto-claimed>`，说明任务来自任务板；如果遇到 `<inbox>`，则尝试把 JSON 解析出来并使用消息 content 作为当前 mission。接着它调用 ROUTER.route 选择模型，再让模型带着本地工具继续执行。
 
@@ -240,14 +240,14 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 
 ### 5.7 模块之间的协同关系
 
-这些模块之间是串联关系，不是平铺关系。`config.py` 负责提供统一的工作区和客户端入口，`router.py` 负责在调用模型之前做分流判断，`main.py` 负责维持主闭环和错误回写，`core_tools.py` 负责安全执行本地命令和文件操作，`managers.py` 负责任务、技能、消息和后台状态，`team.py` 负责把同一套路由和工具逻辑扩展到子智能体与长期队友。这样的分层让系统既能保持单进程的可控性，又能表现出多智能体系统的协作能力。
+这些模块之间是串联关系，不是平铺关系。`config.py` 负责提供统一的工作区和客户端入口，`router.py` 负责在调用模型之前做分流判断，`main.py` 负责维持主闭环和错误回写，`core_tools.py` 负责执行带基础防护的本地命令和文件操作，`managers.py` 负责任务、技能、消息和后台状态，`team.py` 负责把同一套路由和工具逻辑扩展到子智能体与长期队友。这样的分层让系统既能保持单进程的可控性，又能表现出多智能体系统的协作能力。
 
 ## 6. 数据流与持久化
 
 - 持久化目录由 [config.py](config.py) 定义，包含 `.team`、`.tasks`、`.transcripts` 等子目录；系统通过这些目录保存运行时状态以便重启恢复。
 - 种子向量缓存文件 `seed_vectors.json`，由 `precompute_seeds.py` 一次性生成（8 线程并发 Ollama，约 10 秒），Router 启动时直接读取（毫秒级）。文件结构为 `{"small": [{"text": "...", "vector": [...]}, ...], "large": [...]}`，文本与向量一一对应，支持运行时动态增删。
 - 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加方式；超限时触发后台异步 LLM 压缩浓缩，而非简单的 FIFO 淘汰。
-- 任务与队友配置以 `task_{id}.json`、`team/config.json` 等 JSON 文件保存在对应子目录，程序启动时会读取这些文件恢复任务板与队友状态；写入异常会记录日志但不会抛出未处理异常。
+- 任务与队友配置以 `task_{id}.json`、`.team/config.json` 等 JSON 文件保存在对应子目录。程序启动时会重新读取任务文件和队友元数据，但不会恢复队友线程或对话上下文；这些文件写入目前也没有统一的原子写入、异常记录和恢复机制。
 
 ## 7. 部署与运行
 
@@ -317,7 +317,7 @@ python main.py
 - 鲁棒性：
     - 路由器在 [router.py](router.py) 中通过 `_get_embedding` 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时，`_get_embedding` 返回空向量，`route(...)` 在此情况下保守地返回 `large`。
 
-    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数超过 `max_mistakes`（默认 200）时，不再采用简单的 FIFO 淘汰，而是触发后台异步 LLM 压缩（`_trigger_compression_async("mistake")`），将具体报错浓缩为高度概括的通用拦截指令，并通过双重可重入锁（RLock）与快照切片算法无缝覆写内存、持久化到文件。主循环零阻塞。
+    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数达到 `max_mistakes`（默认 200）时，不再采用简单的 FIFO 淘汰，而是触发后台异步 LLM 压缩（`_trigger_compression_async("mistake")`），将具体报错浓缩为高度概括的通用拦截指令。主循环不等待大模型压缩请求，但压缩结果写回内存和文件时仍会短暂获取锁。
 
 - 限制：
     - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，未集成专用近似最近邻索引（如 FAISS/annoy）。在错题本或种子向量规模较大时，查询复杂度为 O(n)，可能成为性能瓶颈。
@@ -325,7 +325,7 @@ python main.py
 
 ## 10. 测试
 
-测试采用 `pytest` 框架，所有测试不依赖 Ollama、不调用 API、不写入真实文件，纯逻辑验证。
+测试采用 `pytest` 框架，共收集 34 项。默认执行 32 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过 mock 与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 34 项。
 
 ### 10.1 测试文件结构
 
@@ -370,7 +370,7 @@ python main.py
 | 测试 | 验证点 |
 |------|--------|
 | `test_record_mistake_writes_file` | `record_mistake` 将失败的查询写入 JSONL 文件且包含 query 与 vector 字段 |
-| `test_mistake_book_max_limit` | 超过 `max_mistakes` 时淘汰最老条目，保持容量上限 |
+| `test_mistake_book_triggers_compression_at_limit` | 达到 `max_mistakes` 时触发一次后台压缩，并保留压缩期间的新记录 |
 
 **种子库管理（5 项）**
 

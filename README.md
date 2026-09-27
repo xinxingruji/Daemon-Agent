@@ -146,7 +146,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-共包含 34 项测试（不含 API 模式 31 项），所有测试均不依赖 Ollama、不调用 API、不写入真实文件，通过 mock 隔离外部依赖。
+共收集 34 项测试。默认运行其中 32 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 34 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock 和临时目录隔离外部依赖。
 
 **测试内容：**
 
@@ -155,7 +155,7 @@ python -m pytest tests/ -v
 | 种子数据完整性 | [tests/test_utterances.py](tests/test_utterances.py) | 4 | SMALL/LARGE 非空、无重复 |
 | 余弦相似度 | [tests/test_router.py](tests/test_router.py) | 4 | 相同向量 → 1.0、正交 → 0、相反 → -1.0、空向量 → 0 |
 | 路由决策 | [tests/test_router.py](tests/test_router.py) | 6 | force_large/force_small 强制升级/降级、空 query 保守兜底、错题本拦截、低于阈值降级、token 惩罚动态升阶 |
-| 错题本管理 | [tests/test_router.py](tests/test_router.py) | 2 | 失败记录写入 JSONL、超出容量时 FIFO 淘汰 |
+| 错题本管理 | [tests/test_router.py](tests/test_router.py) | 2 | 失败记录写入 JSONL、达到容量时触发后台压缩 |
 | 种子库管理 | [tests/test_router.py](tests/test_router.py) | 5 | 添加种子、去重、空文本跳过、按相似度删除、热重载 |
 | 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟、API 延迟多次测量 |
 

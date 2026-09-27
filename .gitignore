@@ -37,7 +37,7 @@ mistakes.json
 benchmark_results.json
 .task_outputs/
 .tasks/
-.teams/
+.team/
 .transcripts/
 
 # Pytest cache
