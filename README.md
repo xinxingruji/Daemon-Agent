@@ -6,7 +6,7 @@
 
 ## 1. 环境准备与依赖安装
 
-克隆项目后，首先安装所需的 Python 依赖包：
+项目支持 Python 3.11 及以上版本。克隆项目后，首先安装所需的 Python 依赖包：
 
 ```bash
 pip install -r requirements.txt
@@ -97,7 +97,7 @@ python precompute_seeds.py
 
 ```
 
-> 本脚本使用 8 线程并发调用 Ollama，约 10 秒完成（82 条种子）。生成 `seed_vectors.json`（约 1.8 MB）后，Router 启动时将直接读取该文件（毫秒级），无需每次启动都重新嵌入。之后若修改了 `utterances.py`，需重新运行本脚本更新缓存。
+> 本脚本使用 8 线程并发调用 Ollama，约 10 秒完成当前 81 条种子。生成的 `seed_vectors.json` 会记录 schema 版本、embedding 模型、向量维度和内置种子哈希；Router 启动时会校验这些元数据。若模型或 `utterances.py` 发生变化，系统会明确提示重新运行本脚本。只有全部种子成功生成后才会替换原缓存。
 
 ---
 
@@ -116,7 +116,26 @@ cp .env.example .env
 
 ```env
 ANTHROPIC_BASE_URL="http://localhost:4000"
+ANTHROPIC_API_KEY="sk-placeholder"
 
+# 可选，以下为默认值
+EMBEDDING_MODEL="nomic-embed-text-v2-moe"
+OLLAMA_EMBEDDING_URL="http://localhost:11434/api/embeddings"
+
+```
+
+### 运行前诊断
+
+启动 Agent 前可执行只读健康检查：
+
+```bash
+python doctor.py
+```
+
+该命令检查 Python 与依赖、`.env`、small/large 模型映射、种子缓存、Ollama embedding 模型和 LiteLLM 端口，不会输出 API Key。若只想检查本地文件和配置，不访问本地服务：
+
+```bash
+python doctor.py --offline
 ```
 
 ### 运行主程序
@@ -128,11 +147,7 @@ python main.py
 
 ```
 
-*(注：如果你的主入口文件仍然叫 `s_full.py`，请替换为 `python s_full.py`)*
-
 进入 `Daemon >>` 终端后，输入你的任务。支持 `!large` / `!small` 前缀强制指定模型，`/reload` 热重载种子库。
-
-```
 
 ---
 
@@ -146,7 +161,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-共收集 34 项测试。默认运行其中 32 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 34 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock 和临时目录隔离外部依赖。
+共收集 47 项测试。默认运行其中 45 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 47 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock、子进程和临时目录隔离外部依赖。
 
 **测试内容：**
 
@@ -158,6 +173,10 @@ python -m pytest tests/ -v
 | 错题本管理 | [tests/test_router.py](tests/test_router.py) | 2 | 失败记录写入 JSONL、达到容量时触发后台压缩 |
 | 种子库管理 | [tests/test_router.py](tests/test_router.py) | 5 | 添加种子、去重、空文本跳过、按相似度删除、热重载 |
 | 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟、API 延迟多次测量 |
+| 缓存 schema | [tests/test_seed_cache.py](tests/test_seed_cache.py) | 6 | 元数据、旧格式兼容、模型/维度/哈希失配 |
+| 缓存预计算 | [tests/test_precompute_seeds.py](tests/test_precompute_seeds.py) | 2 | 部分失败不覆盖旧缓存、成功生成版本化缓存 |
+| 启动诊断 | [tests/test_diagnostics.py](tests/test_diagnostics.py) | 4 | 模型映射、缓存诊断、URL 与密钥脱敏 |
+| 导入副作用 | [tests/test_import_side_effects.py](tests/test_import_side_effects.py) | 1 | 导入 config/main 不初始化运行时或创建目录 |
 
 **运行环境要求：**
 - 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）

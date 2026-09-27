@@ -5,18 +5,28 @@
 """
 
 import json
-import math
 import os
 import urllib.request
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import List, Dict
 
 from utterances import SMALL, LARGE
+from seed_cache import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_URL,
+    build_seed_cache_document,
+)
 
-MODEL_NAME = "nomic-embed-text-v2-moe"
-API_URL = "http://localhost:11434/api/embeddings"
-OUTPUT = "seed_vectors.json"
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+MODEL_NAME = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+API_URL = os.getenv("OLLAMA_EMBEDDING_URL", DEFAULT_EMBEDDING_URL)
+OUTPUT = Path("seed_vectors.json")
 MAX_WORKERS = 8
 
 
@@ -35,7 +45,13 @@ def _get_embedding(text: str) -> List[float]:
         return []
 
 
-def main():
+def main() -> int:
+    global MODEL_NAME, API_URL
+    if load_dotenv is not None:
+        load_dotenv(override=True)
+    MODEL_NAME = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    API_URL = os.getenv("OLLAMA_EMBEDDING_URL", DEFAULT_EMBEDDING_URL)
+
     print(f"[预处理] 开始将种子文本转为向量（{MAX_WORKERS} 线程并发）...")
     print(f"[预处理] 嵌入模型: {MODEL_NAME}")
 
@@ -59,21 +75,36 @@ def main():
             vec = future.result()
             done += 1
             pct = done * 100 // total
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-            status = "✓" if vec else "✗"
+            bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+            status = "OK" if vec else "FAIL"
             print(f"\r  [{status}] 嵌入: |{bar}| {pct}% ({done}/{total})", end="", flush=True)
             if vec:
                 result[route].append({"text": text, "vector": vec})
 
     print()
 
-    with open(OUTPUT, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
     small_count = len(result["small"])
     large_count = len(result["large"])
+    if small_count != len(SMALL) or large_count != len(LARGE):
+        print(
+            "[预处理] 失败：部分种子未生成向量，保留现有缓存不变。",
+            file=sys.stderr,
+        )
+        return 1
+
+    document = build_seed_cache_document(
+        result,
+        embedding_model=MODEL_NAME,
+        source_routes={"small": SMALL, "large": LARGE},
+    )
+    temp_output = OUTPUT.with_suffix(OUTPUT.suffix + ".tmp")
+    with open(temp_output, "w", encoding="utf-8") as f:
+        json.dump(document, f, ensure_ascii=False, indent=2)
+    temp_output.replace(OUTPUT)
+
     print(f"[预处理] 完成！small: {small_count} 条, large: {large_count} 条 → {OUTPUT}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -112,7 +112,8 @@ class TestSeedManagement:
         """添加种子后文本和向量同步追加"""
         r = make_router()
         initial_small = len(r.route_embeddings["small"])
-        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768), \
+                patch.object(r, "_save_seed_vectors"):
             r.add_seed("新任务", "small")
 
         assert len(r.route_embeddings["small"]) == initial_small + 1
@@ -123,7 +124,8 @@ class TestSeedManagement:
         """重复文本不被重复添加"""
         r = make_router()
         initial = len(r.route_embeddings["small"])
-        with patch.object(r, "_get_embedding", return_value=[0.5] * 768):
+        with patch.object(r, "_get_embedding", return_value=[0.5] * 768), \
+                patch.object(r, "_save_seed_vectors"):
             r.add_seed("新任务", "small")
             r.add_seed("新任务", "small")  # 第二次应跳过
 
@@ -140,10 +142,17 @@ class TestSeedManagement:
         """删除与查询向量余弦距离最近的种子"""
         r = make_router()
         # 注入已知向量：三条 small 种子，各有不同方向
-        r.route_embeddings = {"small": [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], "large": []}
-        r.route_embeddings_text = {"small": ["s_a", "s_b", "s_c"], "large": []}
+        r.route_embeddings = {
+            "small": [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
+            "large": [[0.0, 1.0]],
+        }
+        r.route_embeddings_text = {
+            "small": ["s_a", "s_b", "s_c"],
+            "large": ["l_a"],
+        }
         # 查询向量和 [1.0, 0.0] 最接近
-        r.remove_most_similar_seed([0.9, 0.1], "small")
+        with patch.object(r, "_save_seed_vectors"):
+            r.remove_most_similar_seed([0.9, 0.1], "small")
 
         assert len(r.route_embeddings["small"]) == 2
         assert "s_a" not in r.route_embeddings_text["small"]
@@ -158,6 +167,8 @@ class TestSeedManagement:
             # 用 _save 覆写文件，塞入自定义数据再 reload
             r.route_embeddings = {"small": [[0.1] * 768], "large": [[0.9] * 768]}
             r.route_embeddings_text = {"small": ["自定义小"], "large": ["自定义大"]}
+            r.routes = {"small": ["自定义小"], "large": ["自定义大"]}
+            r.base_small_count = 1
             r._save_seed_vectors()
 
             # 修改内存数据再 reload，验证从文件恢复
