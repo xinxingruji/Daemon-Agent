@@ -5,9 +5,18 @@ import sys
 import threading
 import uuid
 from config import client, WORKDIR, SKILLS_DIR, TOKEN_THRESHOLD, VALID_MSG_TYPES, ROUTER
-from core_tools import run_bash, run_read, run_write, run_edit, estimate_tokens, microcompact, is_tool_error
+from core_tools import (
+    estimate_tokens,
+    get_command_executor,
+    microcompact,
+    run_bash,
+    run_edit,
+    run_read,
+    run_write,
+)
 from managers import TodoManager, SkillLoader, TaskManager, BackgroundManager, MessageBus
 from team import TeammateManager, run_subagent, auto_compact
+from tool_result import ErrorKind, ToolResult, ensure_tool_result
 
 # 重配 stdout 编码，防止 UTF-8 内容打印到 GBK 终端时 UnicodeEncodeError
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -42,6 +51,7 @@ def initialize_runtime() -> None:
         system = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
 Use task for subagent delegation. Use load_skill for specialized knowledge.
+High-risk commands may require human approval. Never bypass or repeatedly retry an approval request.
 Skills: {skills.descriptions()}"""
         TODO, SKILLS, TASK_MGR = todo, skills, task_mgr
         BG, BUS, TEAM, SYSTEM = background, bus, team, system
@@ -59,18 +69,22 @@ def handle_shutdown_request(teammate: str) -> str:
     return f"Shutdown request {req_id} sent to '{teammate}'"
 
 # === SECTION: plan_approval (s10) ===
-def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> ToolResult:
     initialize_runtime()
     req = plan_requests.get(request_id)
-    if not req: return f"Error: Unknown plan request_id '{request_id}'"
+    if not req:
+        return ToolResult.failure(
+            f"Unknown plan request_id '{request_id}'",
+            error_kind=ErrorKind.MODEL,
+        )
     req["status"] = "approved" if approve else "rejected"
     BUS.send("lead", req["from"], feedback, "plan_approval_response",
              {"request_id": request_id, "approve": approve, "feedback": feedback})
-    return f"Plan {req['status']} for '{req['from']}'"
+    return ToolResult.success(f"Plan {req['status']} for '{req['from']}'", exit_code=None)
 
 # === SECTION: tool_dispatch (s02) ===
 TOOL_HANDLERS = {
-    "bash":             lambda **kw: run_bash(kw["command"]),
+    "bash":             lambda **kw: run_bash(kw["command"], requester="lead"),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
@@ -95,12 +109,30 @@ TOOL_HANDLERS = {
     "claim_task":       lambda **kw: TASK_MGR.claim(kw["task_id"], "lead"),
 }
 
+
+def invoke_tool(name: str, arguments: dict) -> ToolResult:
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        return ToolResult.failure(f"Unknown tool: {name}", error_kind=ErrorKind.MODEL)
+    try:
+        return ensure_tool_result(handler(**arguments))
+    except (KeyError, TypeError, ValueError) as exc:
+        return ToolResult.failure(
+            f"Invalid arguments for {name}: {exc}",
+            error_kind=ErrorKind.MODEL,
+        )
+    except Exception as exc:
+        return ToolResult.failure(
+            f"Tool {name} failed internally: {exc}",
+            error_kind=ErrorKind.INTERNAL,
+        )
+
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash", "description": "Run a direct command. Shell syntax and high-risk operations require human approval.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file", "description": "Read a workspace file. Runtime credentials and Git internals are protected.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
+    {"name": "write_file", "description": "Atomically write a workspace file outside protected paths.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
@@ -112,7 +144,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     {"name": "compress", "description": "Manually compress conversation context.",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "background_run", "description": "Run command in background thread.",
+    {"name": "background_run", "description": "Run an approved direct command in a background thread using the shared command policy.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
@@ -143,30 +175,6 @@ TOOLS = [
     {"name": "claim_task", "description": "Claim a task from the board.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
-
-def is_tool_error(output: str) -> bool:
-    out_str = str(output).strip()
-    # 这是针对run_bash的，如果返回码非0，那一定出错了
-    # 绝对确定的系统级错误前缀 
-    error_prefixes = (
-        "Error:", 
-        "error:", 
-        "ERROR:",
-        "Unknown",        # 捕获 "Unknown tool: xxx"
-        "KeyError",       # 防御性捕获
-        "Exception",      # 防御性捕获
-        "Traceback",      # 捕获未格式化的 Python 崩溃堆栈
-        "Fatal:",         # 捕获一些底层库的致命错误
-        "Trace/BPT trap"  # 捕获 C 级别底层崩溃
-    )
-    if out_str.startswith(error_prefixes):
-        return True
-        
-    # 特定工具的隐式失败标志
-    if out_str in ("(subagent failed)", "Unknown tool", "(no summary)"):
-        return True
-        
-    return False
 
 # === SECTION: agent_loop ===
 def agent_loop(messages: list, query: str, force_mode: str = ""):
@@ -229,20 +237,16 @@ def agent_loop(messages: list, query: str, force_mode: str = ""):
             if block.type == "tool_use":
                 if block.name == "compress":
                     manual_compress = True
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                out_str = str(output)
+                output = invoke_tool(block.name, block.input)
+                out_str = output.content
                 # 按工具类型定制显示，避免无差别 dump 内容
                 if block.name == "bash":
                     print(f"\033[36m> bash:\033[0m")
                     print(out_str[:200])
                 elif block.name == "read_file":
                     path = block.input.get("path", "").replace(str(WORKDIR), ".")
-                    lines = out_str.count('\n') if not out_str.startswith("Error:") else 0
-                    if out_str.startswith("Error:"):
+                    lines = out_str.count('\n') if output.ok else 0
+                    if not output.ok:
                         print(f"\033[31m> read_file: {out_str[:120]}\033[0m")
                     else:
                         print(f"\033[34m> 📄 read_file: {path} ({lines} 行)\033[0m")
@@ -258,16 +262,20 @@ def agent_loop(messages: list, query: str, force_mode: str = ""):
                     print(out_str[:200])
 
                 # 记录错题本
-                if is_tool_error(output) and current_model == "small":
+                if output.should_record_mistake and current_model == "small":
                     ROUTER.record_mistake(routing_query)
 
                 # 小模型成功但匹配分低 → 把查询加入种子库
-                if not is_tool_error(output) and current_model == "small":
+                if output.ok and current_model == "small":
                     small_score = ROUTER._last_route_scores.get("small", 0.0)
                     if 0 < small_score < ROUTER.threshold + 0.15:
                         ROUTER.add_seed(routing_query, "small")
 
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output.to_model_content(),
+                })
                 if block.name == "TodoWrite":
                     used_todo = True
         # s03: nag reminder (only when todo workflow is active)
@@ -309,6 +317,35 @@ if __name__ == "__main__":
             continue
         if query.strip() == "/reload":
             ROUTER.reload_seeds()
+            continue
+        if query.strip() == "/approvals":
+            pending = get_command_executor().pending()
+            if not pending:
+                print("No pending command approvals.")
+            else:
+                for item in pending:
+                    print(
+                        f"{item['request_id']}: [{item['requester']}] "
+                        f"{item['command']} ({item['reason']})"
+                    )
+            continue
+        if query.strip().startswith("/approve "):
+            request_id = query.strip().split(maxsplit=1)[1]
+            approval_result = get_command_executor().approve(request_id)
+            print(approval_result.to_model_content())
+            history.append({
+                "role": "user",
+                "content": f"<command-approval-result>{approval_result.to_model_content()}</command-approval-result>",
+            })
+            continue
+        if query.strip().startswith("/deny "):
+            request_id = query.strip().split(maxsplit=1)[1]
+            denial_result = get_command_executor().deny(request_id)
+            print(denial_result.to_model_content())
+            history.append({
+                "role": "user",
+                "content": f"<command-approval-result>{denial_result.to_model_content()}</command-approval-result>",
+            })
             continue
         # ── 处理强制模型前缀 ──
         force_mode = ""

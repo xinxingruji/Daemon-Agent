@@ -4,12 +4,14 @@
 import json
 import re
 import threading
-import subprocess
 import time
 import uuid
 from pathlib import Path
 from queue import Queue
+from command_executor import CommandExecutor, CommandPlan
 from config import TASKS_DIR, WORKDIR, INBOX_DIR
+from core_tools import get_command_executor
+from tool_result import ErrorKind, ToolResult
 
 # === SECTION: todos (s03) ===
 class TodoManager:
@@ -69,10 +71,17 @@ class SkillLoader:
         if not self.skills: return "(no skills)"
         return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}" for n, s in self.skills.items())
 
-    def load(self, name: str) -> str:
+    def load(self, name: str) -> ToolResult:
         s = self.skills.get(name)
-        if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
+        if not s:
+            return ToolResult.failure(
+                f"Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}",
+                error_kind=ErrorKind.MODEL,
+            )
+        return ToolResult.success(
+            f"<skill name=\"{name}\">\n{s['body']}\n</skill>",
+            exit_code=None,
+        )
     
 # === SECTION: file_tasks (s07) ===
 class TaskManager:
@@ -141,42 +150,61 @@ class TaskManager:
     
 # === SECTION: background (s08) ===
 class BackgroundManager:
-    def __init__(self):
+    def __init__(self, executor: CommandExecutor | None = None):
         self.tasks = {}
         self.notifications = Queue()
+        self.executor = executor or get_command_executor()
 
-    def run(self, command: str, timeout: int = 120) -> str:
+    def run(self, command: str, timeout: int = 120) -> ToolResult:
+        prepared = self.executor.prepare(
+            command,
+            timeout=timeout,
+            requester="background",
+        )
+        if isinstance(prepared, ToolResult):
+            return prepared
         tid = str(uuid.uuid4())[:8]
         self.tasks[tid] = {"status": "running", "command": command, "result": None}
-        threading.Thread(target=self._exec, args=(tid, command, timeout), daemon=True).start()
-        return f"Background task {tid} started: {command[:80]}"
+        threading.Thread(target=self._exec, args=(tid, prepared), daemon=True).start()
+        return ToolResult.success(
+            f"Background task {tid} started: {command[:80]}",
+            exit_code=None,
+            metadata={"task_id": tid},
+        )
 
-    def _exec(self, tid: str, command: str, timeout: int):
+    def _exec(self, tid: str, plan: CommandPlan):
         try:
-            # 先试 UTF-8，失败回退到系统编码（GBK），避免 API 输出的 UTF-8 被 GBK 解码成乱码
-            r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                               capture_output=True, timeout=timeout)
-            out_bytes = r.stdout + r.stderr
-            output = ""
-            for enc in ['utf-8', 'gbk']:
-                try:
-                    output = out_bytes.decode(enc).strip()[:50000]
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if not output:
-                output = out_bytes.decode('utf-8', errors='replace').strip()[:50000]
-            self.tasks[tid].update({"status": "completed", "result": output or "(no output)"})
-        except Exception as e:
-            self.tasks[tid].update({"status": "error", "result": str(e)})
+            result = self.executor.run_plan(plan)
+        except Exception as exc:
+            result = ToolResult.failure(
+                f"Background command failed internally: {exc}",
+                error_kind=ErrorKind.INTERNAL,
+            )
+        status = "completed" if result.ok else "error"
+        self.tasks[tid].update({"status": status, "result": result})
         self.notifications.put({"task_id": tid, "status": self.tasks[tid]["status"],
-                                "result": self.tasks[tid]["result"][:500]})
+                                "result": result.to_model_content()[:500]})
 
-    def check(self, tid: str = None) -> str:
+    def check(self, tid: str = None) -> ToolResult:
         if tid:
             t = self.tasks.get(tid)
-            return f"[{t['status']}] {t.get('result') or '(running)'}" if t else f"Unknown: {tid}"
-        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" for k, v in self.tasks.items()) or "No bg tasks."
+            if not t:
+                return ToolResult.failure(f"Unknown background task: {tid}", error_kind=ErrorKind.MODEL)
+            result = t.get("result")
+            if isinstance(result, ToolResult):
+                return ToolResult(
+                    status=result.status,
+                    content=f"[{t['status']}] {result.content}",
+                    error_kind=result.error_kind,
+                    exit_code=result.exit_code,
+                    metadata=result.metadata,
+                )
+            return ToolResult.success(f"[{t['status']}] (running)", exit_code=None)
+        listing = "\n".join(
+            f"{key}: [{value['status']}] {value['command'][:60]}"
+            for key, value in self.tasks.items()
+        ) or "No bg tasks."
+        return ToolResult.success(listing, exit_code=None)
 
     def drain(self) -> list:
         notifs = []
