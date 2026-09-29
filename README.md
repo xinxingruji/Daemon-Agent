@@ -160,6 +160,8 @@ python main.py
 
 审批只能由终端用户完成，模型不能批准自己的命令。Agent 文件工具也会阻止直接访问 `.env`、真实 `litellm_config.yaml` 和 `.git`；请通过人工编辑或受控 Git 命令管理这些文件。
 
+任务、inbox 和 Teammate 状态使用进程内共享锁与原子文件替换保护。并发队友只能有一个成功认领同一任务；队友取消、失败或空闲超时后，其未完成任务会自动释放回 `pending`。退出主程序时会停止接收新后台工作，通知 Teammate 退出，并在有限时间内等待受管线程结束。重启后只恢复队友元数据，不会假装恢复未持久化的模型对话或线程执行现场；原先处于活动状态的队友会标记为 `interrupted`。
+
 ---
 
 ## 6. 测试
@@ -172,7 +174,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-共收集 91 项测试。默认运行其中 89 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 91 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过依赖注入、mock、子进程和临时目录隔离外部依赖。
+共收集 107 项测试。默认运行其中 105 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 107 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过依赖注入、mock、子进程和临时目录隔离外部依赖。
 
 **测试内容：**
 
@@ -192,6 +194,7 @@ python -m pytest tests/ -v
 | Embedding 服务 | [tests/test_embedding_service.py](tests/test_embedding_service.py) | 6 | 文本规范化、有界 LRU、淘汰、失败重试、并发请求合并与 Router 复用 |
 | 压缩一致性 | [tests/test_router_compression.py](tests/test_router_compression.py) | 12 | 响应 schema、数量/去重/维度校验、原子替换、并发到达与陈旧快照保护 |
 | 路由评测 | [tests/test_router_evaluation.py](tests/test_router_evaluation.py) | 5 | 数据集 schema、代理指标、误降级/误升级与风险加权阈值比较 |
+| 状态可靠性 | [tests/test_state_reliability.py](tests/test_state_reliability.py) | 16 | 并发任务创建/认领、inbox 无丢失消费、原子写入、状态恢复、预算、取消、任务释放、启动/关闭竞态与优雅退出 |
 
 **运行环境要求：**
 - 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）
