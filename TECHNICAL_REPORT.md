@@ -11,7 +11,11 @@
 - [config.py](config.py)：系统路径、环境加载与客户端/Router 惰性初始化。
 - [diagnostics.py](diagnostics.py) / [doctor.py](doctor.py)：只读启动诊断。
 - [seed_cache.py](seed_cache.py)：种子缓存 schema、哈希和一致性校验。
-- [router.py](router.py)：路由器核心逻辑（语义匹配、错题拦截、动态 Token 惩罚）。
+- [router.py](router.py)：保持兼容的路由器编排入口。
+- [embedding_service.py](embedding_service.py)：embedding 请求、有界 LRU 与并发请求合并。
+- [routing_policy.py](routing_policy.py)：无 I/O 的相似度、错题拦截与动态阈值决策。
+- [router_compression.py](router_compression.py)：压缩响应校验和原子持久化。
+- [router_eval.py](router_eval.py) / [routing_eval_cases.json](routing_eval_cases.json)：可复现的离线路由代理评测。
 - [main.py](main.py)：主循环、工具集（TOOLS）与 Agent 调度。
 - [team.py](team.py)：Teammate 和 Subagent 管理、上下文压缩逻辑。
 - [core_tools.py](core_tools.py)：受保护的本地文件工具与统一命令入口。
@@ -34,7 +38,7 @@
 - 微观/宏观双轨路由器 `Claude_Router`（[router.py](router.py)）
     - 目的：在运行时根据语义匹配、历史失败与上下文规模自动选择 `small` 或 `large` 模型，最大化使用低成本小模型同时在风险场景保证正确性。
 
-    - 实现要点：通过 `precompute_seeds.py` 预处理种子文本为 768 维向量并缓存到 `seed_vectors.json`（8 线程并发，约 10 秒），Router 启动时直接读取（毫秒级）；对查询做在线向量化匹配，结合 `mistake_book` 与动态 token 惩罚计算最终决策；运行时支持 `add_seed` 动态添加种子（`remove_most_similar_seed` 方法保留但未被主循环调用，改为后台压缩机制统一管理剔除）；当嵌入不可用或 `force_large`/`force_small` 为真时返回对应模型。除了预计算静态种子向量外，路由器支持在运行时收集小模型的“成功经验”（add_seed）。为了防止经验库过拟合与膨胀，系统引入了正向经验蒸馏机制：当动态积累的种子数量超过阈值时，自动触发后台大模型（LLM）异步压缩，将几十条零散的具体任务抽象提炼为少数几个高级泛化的“能力锚点”。合并过程采用数组切片算法，严格保护前 N 个出厂静态种子不被修改。
+    - 实现要点：通过 `precompute_seeds.py` 预处理种子文本为 768 维向量并缓存到 `seed_vectors.json`（8 线程并发，约 10 秒），Router 启动时直接读取（毫秒级）；`EmbeddingProvider` 对规范化 query 使用可配置的有界 LRU，并把并发相同请求合并为一次 Ollama 调用；`RoutingPolicy` 以无 I/O 纯策略组合错题拦截、语义得分和动态 token 阈值。运行时继续支持 `add_seed`、强制路由与后台经验压缩，外部 `Claude_Router` API 保持兼容。
     - 意义：显著降低对大模型的调用次数（成本与延迟），同时通过精细化判定降低小模型误判带来的失败风险；种子库可在运行中自我进化，适合工程化部署场景。
 
 - 种子库动态增强回路（[main.py](main.py) 的 `agent_loop`）
@@ -44,7 +48,7 @@
 
 - 错题本（mistake book）（[router.py](router.py) 的 `record_mistake` 与 `_load_mistakes`）
     - 目的：捕捉并记忆小模型在工具执行时的失败上下文与向量表示，防止系统在后续相似查询上重复犯相同错误。
-    - 实现要点：当小模型产生未知工具、非法参数等可归因于模型能力的调用错误时，将其 Query 向量化并记入错题本。相比传统的 FIFO 淘汰，系统实现了后台异步 LLM 压缩机制：当错题满载时，大模型在后台将 200 条具体报错浓缩为 10-20 条涵盖核心难点的通用拦截指令，并通过可重入锁（RLock）与快照切片算法写回内存。主循环不等待大模型压缩请求，但写回阶段仍会短暂获取锁。
+    - 实现要点：当小模型产生未知工具、非法参数等可归因于模型能力的调用错误时，将其 Query 向量化并记入错题本。相比传统的 FIFO 淘汰，系统实现了后台异步 LLM 压缩机制：当错题满载时，大模型在后台将 200 条具体报错浓缩为 10-20 条涵盖核心难点的通用拦截指令。写回前严格检查 JSON 数组、字符串类型、条目数量、去重和全部向量维度，使用原子文件替换，并在锁内验证原快照仍有效、保留压缩期间新增的记录。
 
 - 统一工具安全边界（[command_executor.py](command_executor.py) 与 [tool_result.py](tool_result.py)）
     - 目的：让主 Agent、后台任务、Subagent 和 Teammate 共享相同的命令策略和错误语义，消除通过其他执行路径绕过限制的可能。
@@ -184,22 +188,24 @@ sequenceDiagram
 
 ### 5.2 `router.py`：语义路由、错题本与动态阈值
 
-[router.py](router.py) 的核心实现是一个三段式决策器：先做错题本拦截，再做语义相似度匹配，最后做 token 惩罚修正。初始化时，类里先写死两组种子短语，分别代表低风险任务和高风险任务，然后对每条种子文本调用本地嵌入接口 `http://localhost:11434/api/embeddings` 生成向量并缓存到 `route_embeddings`。这样做的好处是，运行时只需要对用户 query 计算一次 embedding，后面就可以直接和缓存向量做余弦相似度比对，不必每次都重新构造路由知识库。
+[router.py](router.py) 现在是保持外部 API 兼容的编排层，核心职责被拆成三部分：[embedding_service.py](embedding_service.py) 负责 embedding 获取和复用，[routing_policy.py](routing_policy.py) 负责无 I/O 的三段式决策，[router_compression.py](router_compression.py) 负责压缩结果校验与原子持久化。三段式决策语义保持不变：先做错题本拦截，再做语义相似度匹配，最后做 token 惩罚修正。
 
 为消除每次启动都要逐条调 Ollama 嵌入的启动延迟，项目提供 `precompute_seeds.py` 与 `seed_vectors.json` 向量缓存机制。预处理脚本使用 8 线程并发生成当前 81 条种子，只有全部成功且维度一致时才以临时文件替换原缓存，避免失败运行破坏已有数据。版本化缓存由 `seed_cache.py` 生成和校验，元数据包含 schema 版本、embedding 模型、向量维度和内置种子哈希。Router 兼容旧格式缓存并给出升级警告；新版缓存若模型、维度或种子哈希不匹配，会明确提示重新预计算并尝试从 Ollama 重建。
 
 Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新查询文本向量化并追加到指定路由类别（small/large），`reload_seeds()` 支持热重载 `seed_vectors.json` 而无需重启进程。`remove_most_similar_seed(query_vector, route)` 方法仍保留但未被 `main.py` 调用，种子库的剔除由后台异步压缩机制统一管理。`route()` 方法新增 `force_small` 参数（为 True 时直接返回 "small"），同时记录 `_last_query_vector`、`_last_route_scores` 和 `_last_best_route`，供主循环的种子反馈逻辑使用。路由决策核心（错题本 → 语义匹配 → token 惩罚）本身未变。
 
-`_get_embedding(text)` 的实现是一次简单的 HTTP POST 请求，失败时直接返回空列表；而 `route(...)` 会把这个失败视为保守信号，直接回退到 `large`。这是一种典型的 fail-safe 逻辑：向量不可用时宁可升大模型，也不把任务误派给小模型。
+`_get_embedding(text)` 委托给 `EmbeddingProvider`。输入先做 NFKC 与空白规范化但保留大小写，再查询容量默认 256 的线程安全 LRU；并发的相同 query 由 in-flight 事件合并为一次实际 HTTP 请求，失败不进入缓存，调用方可通过 `embedding_cache_stats()` 观察命中、未命中、实际请求和失败数量。容量可由 `EMBEDDING_CACHE_SIZE` 设置，`0` 表示关闭缓存。请求失败仍返回空列表，`route(...)` 将其保守地回退到 `large`。
 
 具体路由时，算法顺序如下。第一步，如果 `force_large` 为真，立刻返回 `large`，这给外部调用者一个硬性覆盖口。第二步，对 query 做向量化，并逐条扫描 `mistake_book`，用 `_cosine_similarity` 计算 query 与历史失败向量的夹角相似度；只要任意一条大于 `mistake_threshold`，就立即升级到 `large`。第三步，把 query 向量与 `route_embeddings` 中的所有候选向量做余弦相似度比较，保留最高分 `highest_score` 和对应路由 `best_route`。如果最佳路由本身是 `large`，或者 `highest_score` 没超过基础阈值 `threshold`，也直接返回 `large`。
 
 只有当 best_route 是 small 且基础分数过线时，系统才进入动态惩罚阶段。这里的惩罚不是重新训练模型，而是修改决策阈值：先用 `total_tokens - safe_tokens` 计算超额 token 数，再除以 `penalty_step` 得到阶梯数 `extra_steps`，最后乘以 `penalty_rate` 形成 penalty，并把 `dynamic_threshold` 上调到 `threshold + penalty`，上限封顶 0.99。也就是说，上下文越长，小模型需要更高的语义匹配分数才能被继续放行。
 
-异步提炼与并发控制（知识蒸馏）
+**异步提炼与并发控制（知识蒸馏）**
 路由器最大的工程亮点在于其内置的 _trigger_compression_async(target) 大压缩机制。为了解决动态种子库膨胀和错题本冗余的问题，系统废弃了传统的“先进先出”或“就地删除”策略，转而引入了 LLM 知识蒸馏。
 当错题本或新增种子数达到设定的满载阈值时，路由器会加锁获取当前数据的快照（Snapshot），并立即释放锁，随后在后台守护线程中唤醒大模型。大模型根据 target 的不同（mistake 或 seed），动态组装 Prompt，将碎片化的文本抽象合并为高度概括的 JSON 数组。
-为了解决后台压缩期间主线程产生新数据导致的竞态条件（Race Condition）与数据丢失问题，系统采用了双重可重入锁（threading.RLock）和O(1) 切片合并算法：在合并阶段，利用 [N: N+S] 的数组切片精准定位并剥离被压缩的旧快照，再将“出厂底座 + 大模型提炼的新锚点 + 压缩期间产生的新数据”进行无缝拼接。这一机制保证了主 ReAct 循环绝对非阻塞，且在极高并发下数据零丢失。
+后台结果只有在满足目标条数（seed 为 5–8 条、mistake 为 10–20 条）、JSON 字符串数组、非空、规范化后无重复，并且所有新 embedding 均存在且维度一致时才会进入写回阶段。写回在锁内重新确认快照身份，先用同目录临时文件、`fsync` 和 `os.replace` 原子落盘，再更新内存；快照期间到达的新记录会拼接保留，热重载或其他修改导致的陈旧结果则被拒绝。这样避免部分向量、损坏文件和过时压缩覆盖最新状态。
+
+项目还提供 [routing_eval_cases.json](routing_eval_cases.json) 与 [router_eval.py](router_eval.py)。前者当前包含 24 条带类别和理由的自然语言标注，small/large 各 12 条；后者输出准确率、两类准确率、误降级、误升级、估算成本和纯策略延迟。默认 hashing embedding 是确定性的词法代理，只用于离线 CI 与回归趋势，不代表生产语义模型质量。当前代理结果在阈值 0.45 下为 83.3% 准确率、0 次误降级和 4 次误升级；风险加权比较建议 0.40，但由于该证据不足以代表真实语义表现，生产默认阈值继续保持 0.45，待真实 Ollama embedding 与更大标注集复测后再校准。
 
 ### 5.3 `main.py`：主循环、工具分发与总控逻辑
 
@@ -316,7 +322,7 @@ python main.py
 
 [benchmark.py](benchmark.py) 提供本地和 API 两种基准测试模式。详细测试数据见第 11 节。
 
-> **关于路由初始化耗时**：benchmark 本地模式通过 mock 拦截 `_get_embedding` 调用（直接返回固定向量，不实际访问 Ollama），因此初始化耗时仅 742 µs。生产环境优先读取已校验的 `seed_vectors.json`；仅在缓存缺失或失效时才逐条调用 Ollama 的 `/api/embeddings` 接口（默认使用 `nomic-embed-text-v2-moe`）重建种子。运行时每次 `route()` 仍需为 query 请求一次 embedding，历史实测约 4 秒。benchmark 的设计意图是只测量路由逻辑本身的纯计算开销，排除外部服务波动。
+> **关于路由初始化耗时**：benchmark 本地模式通过 mock 拦截 embedding 调用（直接返回固定向量，不实际访问 Ollama），因此初始化耗时仅 742 µs。生产环境优先读取已校验的 `seed_vectors.json`；仅在缓存缺失或失效时才逐条调用 Ollama 的 `/api/embeddings` 接口（默认使用 `nomic-embed-text-v2-moe`）重建种子。运行时冷 query 仍需请求一次 embedding，规范化后的相同 query 会命中有界 LRU。benchmark 的设计意图是只测量路由逻辑本身的纯计算开销，排除外部服务波动。
 
 ## 9. 安全性、鲁棒性与限制
 
@@ -327,17 +333,18 @@ python main.py
     - 该层是应用级策略边界，不是操作系统沙箱。用户批准运行的项目脚本仍拥有当前操作系统账户本身的文件权限，因此只应批准理解且信任的命令。
 
 - 鲁棒性：
-    - 路由器在 [router.py](router.py) 中通过 `_get_embedding` 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时，`_get_embedding` 返回空向量，`route(...)` 在此情况下保守地返回 `large`。
+    - 路由器通过 [embedding_service.py](embedding_service.py) 调用本地嵌入服务（默认 `http://localhost:11434/api/embeddings`）。当嵌入请求超时或失败时返回空向量，`route(...)` 保守地返回 `large`；失败结果不缓存，可在后续请求中恢复。
 
-    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数达到 `max_mistakes`（默认 200）时，不再采用简单的 FIFO 淘汰，而是触发后台异步 LLM 压缩（`_trigger_compression_async("mistake")`），将具体报错浓缩为高度概括的通用拦截指令。主循环不等待大模型压缩请求，但压缩结果写回内存和文件时仍会短暂获取锁。
+    - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数达到 `max_mistakes`（默认 200）时，触发后台异步 LLM 压缩。压缩响应、数量和向量维度必须全部通过校验，文件原子替换成功后才更新内存；并发新增条目不会被覆盖。
 
 - 限制：
-    - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，未集成专用近似最近邻索引（如 FAISS/annoy）。在错题本或种子向量规模较大时，查询复杂度为 O(n)，可能成为性能瓶颈。
+    - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，复杂度为 O(n)。当前内置种子只有 81 条，继续保持线性扫描比引入 FAISS/HNSW 更简单；数据规模明显增长且基准确认扫描成为瓶颈后再评估 ANN。
+    - 离线评测的 hashing embedding 是词法代理，不能作为真实语义准确率或生产阈值调整的唯一依据。
     - `estimate_tokens(messages)` 使用 `len(json.dumps(messages, default=str)) // 4` 作为简化估算，非基于真实 tokenizer 计数，可能导致触发压缩的阈值与实际 token 使用存在偏差。
 
 ## 10. 测试
 
-测试采用 `pytest` 框架，共收集 67 项。默认执行 65 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过 mock、子进程与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 67 项。
+测试采用 `pytest` 框架，共收集 91 项。默认执行 89 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过依赖注入、mock、子进程与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 91 项。
 
 ### 10.1 测试文件结构
 
@@ -346,10 +353,13 @@ python main.py
 - [tests/test_benchmarks.py](tests/test_benchmarks.py) — 性能基准测试（13 项，含 API 延迟多次测量与路由准确率模拟）
 - [tests/test_seed_cache.py](tests/test_seed_cache.py) — 验证缓存 schema、旧格式兼容和元数据失配
 - [tests/test_precompute_seeds.py](tests/test_precompute_seeds.py) — 验证预计算失败保护和版本化缓存写入
-- [tests/test_diagnostics.py](tests/test_diagnostics.py) — 验证 doctor 的配置检查与脱敏输出
+- [tests/test_diagnostics.py](tests/test_diagnostics.py) — 验证 doctor 的配置、embedding 缓存容量检查与脱敏输出
 - [tests/test_import_side_effects.py](tests/test_import_side_effects.py) — 验证导入模块不初始化运行时或创建目录
 - [tests/test_tool_safety.py](tests/test_tool_safety.py) — 验证结构化结果、统一审批、环境隔离、保护路径、原子写入与无隐式 shell
-- [tests/conftest.py](tests/conftest.py) — 提供 mock 工具函数，拦截 `_get_embedding`、`_load_mistakes`、`_load_seed_vectors`、`_save_seed_vectors`，避免触发外部服务与文件读写
+- [tests/test_embedding_service.py](tests/test_embedding_service.py) — 验证有界 LRU、失败重试、并发合并和 Router 重用
+- [tests/test_router_compression.py](tests/test_router_compression.py) — 验证压缩 schema、维度、原子写入和并发一致性
+- [tests/test_router_evaluation.py](tests/test_router_evaluation.py) — 验证评测集 schema、指标和风险加权阈值比较
+- [tests/conftest.py](tests/conftest.py) — 注入离线 embedding provider 并隔离文件路径，避免触发外部服务与项目运行数据写入
 
 ### 10.2 种子数据测试（4 项）
 
@@ -472,7 +482,7 @@ python -m pytest tests/ -v
 | large (deepseek-v4-pro) | 907ms, 716ms, 972ms | 0.907 秒 |
 | 路由决策开销（含 Ollama 嵌入） | — | 4.55 秒 → large |
 
-路由决策的约 4.5 秒主要消耗在 Ollama 的 `/api/embeddings` 调用上（将 query 转为 768 维向量）；纯算法部分（余弦匹配、错题本扫描、动态阈值）仅约 400 µs。相比 API 模型调用本身（约 1 秒以内），**嵌入服务是路由延迟的主要瓶颈**，而非路由逻辑本身。
+冷路由决策的约 4.5 秒主要消耗在 Ollama 的 `/api/embeddings` 调用上（将 query 转为 768 维向量）；纯算法部分（余弦匹配、错题本扫描、动态阈值）仅约 400 µs。相比 API 模型调用本身（约 1 秒以内），**嵌入服务是冷查询路由延迟的主要瓶颈**，而非路由逻辑本身；新增的 LRU 会消除重复 query 的这部分网络开销，但不会加速首次出现的 query。
 
 ## 12. 结论
 

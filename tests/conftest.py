@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from embedding_service import EmbeddingProvider
 from router import Claude_Router
 
 
@@ -28,6 +29,14 @@ def _fake_load_seeds(self):
 
 def make_router(**kwargs):
     """创建一个不调用 Ollama、不读写磁盘的 Router 实例"""
+    kwargs.setdefault(
+        "embedding_provider",
+        EmbeddingProvider(
+            model_name="test-model",
+            api_url="http://unused.invalid",
+            fetcher=lambda text: [0.5] * DIM,
+        ),
+    )
     with patch.object(Claude_Router, "_get_embedding", return_value=[0.5] * DIM):
         with patch.object(Claude_Router, "_load_mistakes", return_value=[]):
             with patch.object(Claude_Router, "_load_seed_vectors",

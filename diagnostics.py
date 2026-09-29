@@ -18,6 +18,7 @@ from seed_cache import (
     DEFAULT_EMBEDDING_URL,
     validate_seed_cache,
 )
+from embedding_service import DEFAULT_EMBEDDING_CACHE_SIZE
 from utterances import LARGE, SMALL
 
 
@@ -200,6 +201,21 @@ def check_seed_cache(path: Path, expected_model: str) -> DiagnosticResult:
     )
 
 
+def check_embedding_cache_size(value: str) -> DiagnosticResult:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return DiagnosticResult(
+            "embedding-cache", "error", "EMBEDDING_CACHE_SIZE must be an integer",
+        )
+    if size < 0:
+        return DiagnosticResult(
+            "embedding-cache", "error", "EMBEDDING_CACHE_SIZE must be non-negative",
+        )
+    message = "disabled" if size == 0 else f"capacity={size}"
+    return DiagnosticResult("embedding-cache", "ok", message)
+
+
 def check_ollama(api_url: str, model_name: str, timeout: float) -> DiagnosticResult:
     parsed = urlsplit(api_url)
     tags_url = urlunsplit((parsed.scheme, parsed.netloc, "/api/tags", "", ""))
@@ -267,12 +283,16 @@ def run_diagnostics(
     embedding_url = _setting(
         "OLLAMA_EMBEDDING_URL", env_file, DEFAULT_EMBEDDING_URL,
     )
+    embedding_cache_size = _setting(
+        "EMBEDDING_CACHE_SIZE", env_file, str(DEFAULT_EMBEDDING_CACHE_SIZE),
+    )
     base_url = _setting("ANTHROPIC_BASE_URL", env_file)
 
     results = [check_python(), *check_dependencies()]
     results.extend(check_environment(env_file, env_path))
     results.append(check_model_mapping(workdir / "litellm_config.yaml"))
     results.append(check_seed_cache(workdir / "seed_vectors.json", embedding_model))
+    results.append(check_embedding_cache_size(embedding_cache_size))
     results.append(DiagnosticResult(
         "workspace", "ok" if os.access(workdir, os.W_OK) else "error",
         "writable" if os.access(workdir, os.W_OK) else "not writable",
