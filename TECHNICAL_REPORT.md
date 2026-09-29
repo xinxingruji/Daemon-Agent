@@ -22,6 +22,7 @@
 - [command_executor.py](command_executor.py)：命令风险分级、一次性审批、环境隔离与子进程执行。
 - [tool_result.py](tool_result.py)：跨执行路径共享的结构化工具结果。
 - [managers.py](managers.py)：任务管理、消息总线、Todo 与技能加载等管理器实现。
+- [state_persistence.py](state_persistence.py)：线程共享的路径锁与原子状态文件写入。
 - [requirements.txt](requirements.txt)：依赖清单。
 
 ## 2. 项目基线与创新
@@ -209,7 +210,7 @@ Router 新增了种子库运行时管理能力：`add_seed(text, route)` 将新�
 
 ### 5.3 `main.py`：主循环、工具分发与总控逻辑
 
-[main.py](main.py) 的实现逻辑可以拆成“初始化管理器、准备工具表、运行 ReAct 闭环”三部分。文件开头先创建 `TODO`、`SKILLS`、`TASK_MGR`、`BG`、`BUS`、`TEAM` 这些全局实例，等于把待办、技能、任务、后台任务、消息和队友状态全部挂到同一个运行时里。随后构造 `SYSTEM` 提示词，把技能摘要通过字符串拼接注入模型上下文，这样模型在推理时可以直接看到当前可用能力。
+[main.py](main.py) 的实现逻辑可以拆成“惰性初始化管理器、准备工具表、运行 ReAct 闭环”三部分。模块导入时 `TODO`、`SKILLS`、`TASK_MGR`、`BG`、`BUS`、`TEAM` 均为空；首次运行时由 `initialize_runtime()` 在线程锁内一次性完成组装并生成 `SYSTEM` 提示词。`shutdown_runtime()` 与 `atexit` 钩子则停止接收新后台工作、请求 Teammate 退出，并在有限时间内等待受管线程，重复调用不会重复关闭。
 
 `TOOLS` 和 `TOOL_HANDLERS` 是主循环的两个关键表。`TOOLS` 定义了工具 schema，告诉大模型每个工具的名字、输入字段和约束；`TOOL_HANDLERS` 则把工具名映射到实际 Python 函数。真正执行时，模型先返回 tool_use block，主循环再根据 `block.name` 从 `TOOL_HANDLERS` 取处理函数，最终把输出包装成 `tool_result` 送回模型。这个“模型提议动作、代码执行动作、结果回灌”的回路，就是标准的 ReAct 控制逻辑。
 
@@ -233,23 +234,25 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 
 `SkillLoader` 则是一个面向目录的解析器。它遍历 skills 目录下所有的 SKILL.md 文件，读取文本后先尝试用 front matter 解析元信息，再把解析出的 meta 和 body 存入内存字典。实现上它不是做复杂的 YAML 解析，而是用一个简单的正则把首尾的分隔区间切出来，再逐行按冒号分割键值，因此对技能文件格式的要求比较稳定：前面放元信息，后面放正文。`load(name)` 则直接把 body 包装成 skill 标签字符串返回，方便主模型把技能内容原样注入上下文。
 
-`TaskManager` 使用文件系统作为任务数据库。`create(subject, description)` 会先通过扫描 `task_*.json` 计算下一个 id，再把任务写成 JSON 文件；`get` 读取单个任务文件；`update` 负责维护状态、依赖和删除逻辑。这里最关键的逻辑是依赖关系：当某个任务完成时，代码会遍历所有 task 文件，检查是否有其他任务的 blockedBy 包含当前任务 id，如果有就移除该依赖。这样一来，任务完成会自动解锁后续任务，避免人工同步依赖状态。
+`TaskManager` 使用文件系统作为轻量任务数据库。同一任务目录的所有管理器实例共享一个进程内 `RLock`，因此“扫描下一个 id + 创建文件”和“检查可认领状态 + 写入 owner”都在一个临界区内完成；多个 Teammate 并发创建或认领时不会获得重复 id，也不能同时抢到同一任务。任务文件通过临时文件、`fsync` 与 `os.replace` 原子替换。状态明确为 `pending`、`in_progress`、`completed`、`failed`、`cancelled`，非法转换会被拒绝，失败原因会持久化；完成任务仍会自动解除其他任务的 `blockedBy`。队友退出、失败或超时后，`release_owner` 会把它持有的未完成任务释放回 `pending` 并记录原因。
 
-`BackgroundManager` 的实现是典型的线程加队列模型。`run(command, timeout)` 先调用共享 `CommandExecutor.prepare()`；若命令被拒绝或需要审批，不创建后台线程。通过预检后才分配任务 id，并在线程中执行同一个 `CommandPlan`。结果以 `ToolResult` 保存在任务表并写入通知队列，因此后台命令不能绕过前台的风险分级、环境隔离与输出限制。
+`BackgroundManager` 的实现是线程加队列模型。`run(command, timeout)` 先调用共享 `CommandExecutor.prepare()`；若命令被拒绝或需要审批，不创建后台线程。通过预检后才分配任务 id，并在线程中执行同一个 `CommandPlan`。任务表和线程表受锁保护，通知队列使用无竞态的 `get_nowait` 消费。进入 shutdown 后不再接收新工作，`shutdown(timeout)` 会有界等待已经启动的线程并报告仍在运行的数量。底层命令仍由 `CommandExecutor` 自身的 timeout 负责终止。
 
-`MessageBus` 则是基于 inbox 文件的轻量消息总线。`send` 不是把消息放入数据库，而是直接把 JSON 序列化后 append 到对应接收者的 JSONL 文件；`read_inbox(name)` 读取整份文件，解析完后立即清空，这相当于实现了“消费即删除”的收件箱语义。`broadcast` 只是对所有队友名字循环调用 `send`，因此它的复杂度完全由队友数量决定，逻辑非常直接。
+`MessageBus` 是基于 inbox JSONL 文件的轻量消息总线。每个 inbox 路径使用共享锁，`send` 在锁内追加、刷新并 `fsync`；`read_inbox` 在同一把锁内完整解析后才原子清空，因此不会再发生“读完、清空之前另一个线程追加，随后新消息被清掉”的竞态。如果任意行 JSON 损坏，读取会失败并保留原文件，而不是破坏性清空。接收者名称不能包含路径分隔符，消息元数据也不能覆盖 type、from、content 和 timestamp 等保留字段。
 
 ### 5.6 `team.py`：子智能体与持久化队友
 
 [team.py](team.py) 的核心逻辑分成两部分：子智能体执行和长期队友管理。
 
-`run_subagent(prompt, agent_type)` 是一个短生命周期执行器。它先根据 agent_type 构造工具集合，默认只开放 bash 和 read_file；如果不是 Explore，还会额外开放写文件和编辑文件。然后它创建一段只包含用户 prompt 的消息序列，在最多 30 轮里反复调用模型、执行工具、回灌结果。每一轮都会先用 ROUTER.route(query=prompt, total_tokens=...) 决定用 small 还是 large。Subagent 和 Teammate 都通过与主 Agent 相同的 `ToolResult` 分发函数和共享命令执行器调用工具；只有模型调用错误会进入错题本，环境、工具和权限结果保持独立。
+`run_subagent(prompt, agent_type, max_rounds=30)` 是一个短生命周期执行器。它先根据 agent_type 构造工具集合，默认只开放 bash 和 read_file；如果不是 Explore，还会额外开放写文件和编辑文件。然后它在明确的轮次预算内反复调用模型、执行工具、回灌结果；预算耗尽会返回结构化失败，不会无限循环。每一轮都会先用 Router 决定 small 或 large。Subagent 和 Teammate 都通过与主 Agent 相同的 `ToolResult` 分发函数和共享命令执行器调用工具，因此继承相同的审批、路径和最小环境策略。
 
-`TeammateManager` 则是持久化协作的核心。`spawn(name, role, prompt)` 会先检查同名队友是否已经存在，如果存在且状态不是 idle 或 shutdown，就直接拒绝重复启动；如果可以复用，就更新角色并把状态改成 working。随后它启动一个后台线程执行 `_loop(name, role, prompt)`，让队友独立运行。配置文件保存在 `.team/config.json` 中，因此下次启动时可以重新读取队友列表和最后记录的状态；当前实现不会自动恢复已经终止的线程、对话上下文或执行现场。
+`TeammateManager` 是持久化协作的核心。状态包括 `starting`、`working`、`idle`、`stopping`、`shutdown`、`failed`、`timed_out` 和 `interrupted`，并持久化状态原因与更新时间。`spawn` 同时检查同名活动线程和最大并发数（默认 4），每个工作激活阶段有明确轮次预算（默认 50）。`request_shutdown` 使用每个队友独立的 `Event` 发出取消信号，idle 等待也用可中断的 `Event.wait`，因此不必等完整轮询周期。无论正常关闭、失败还是空闲超时，包装器都会释放该队友持有的未完成任务并记录最终原因。
+
+`.team/config.json` 只保存队友身份和生命周期元数据，不保存 Python 线程、模型响应对象或完整对话执行现场。进程重启时，如果文件里某个队友仍显示为 `starting`、`working`、`idle` 或 `stopping`，系统会明确把它标记为 `interrupted`，原因是“进程已重启，执行上下文未持久化”，而不是把旧元数据误认为仍在运行。重新 `spawn` 会创建全新的执行上下文。
 
 在 `_loop` 内部，队友的行为是一个“工作阶段 + 空闲阶段”的循环。工作阶段里，线程先轮询自己的 inbox，读到 shutdown_request 就立即退出；如果收到普通消息，就把消息包装成 `<inbox>...</inbox>` 形式追加到上下文。随后它会从最近的消息里提炼 mission：如果遇到 `<auto-claimed>`，说明任务来自任务板；如果遇到 `<inbox>`，则尝试把 JSON 解析出来并使用消息 content 作为当前 mission。接着它调用 ROUTER.route 选择模型，再让模型带着本地工具继续执行。
 
-空闲阶段里，队友会先把状态切成 idle，再按 POLL_INTERVAL 轮询 inbox 和任务目录。若 inbox 里出现新消息，就恢复工作；若任务目录里出现未认领且没有 blockedBy 的任务，就自动 claim，并把任务写回上下文作为 `<auto-claimed>`。如果长时间都没有新消息和新任务，就把状态切成 shutdown 并退出线程。为了避免压缩上下文后丢失身份信息，当 messages 变得很短时，代码还会重新注入 `<identity>` 片段，把 name、role 和 team_name 放回上下文，保证队友始终知道自己是谁。
+空闲阶段里，队友会先把状态切成 `idle`，再按 `POLL_INTERVAL` 轮询 inbox，并通过 `TaskManager.claim_next` 在同一临界区内原子查找和认领首个可用任务。收到消息或认领任务后恢复 `working`；达到 `IDLE_TIMEOUT` 则记录为 `timed_out` 并退出。为了避免短上下文丢失身份信息，自动认领时仍会按需注入 `<identity>` 片段。
 
 ### 5.7 模块之间的协同关系
 
@@ -260,7 +263,7 @@ REPL 部分的 `/compact`、`/tasks`、`/team`、`/inbox` 命令，本质上是�
 - 持久化目录由 [config.py](config.py) 定义，包含 `.team`、`.tasks`、`.transcripts` 等子目录；系统通过这些目录保存运行时状态以便重启恢复。
 - 种子向量缓存文件 `seed_vectors.json` 由 `precompute_seeds.py` 一次性生成。顶层 `_meta` 记录 schema 版本、embedding 模型、向量维度和 `utterances.py` 源哈希，`small`/`large` 数组保存文本与向量。Router 仍能读取没有 `_meta` 的旧缓存，但会提示重新预计算升级格式。
 - 错题本默认文件 `mistakes.json`，采用 JSONL 格式（每行为一个 JSON 对象，包含 `query` 与 `vector` 字段），写入采用追加方式；超限时触发后台异步 LLM 压缩浓缩，而非简单的 FIFO 淘汰。
-- 任务与队友配置以 `task_{id}.json`、`.team/config.json` 等 JSON 文件保存在对应子目录。程序启动时会重新读取任务文件和队友元数据，但不会恢复队友线程或对话上下文；这些文件写入目前也没有统一的原子写入、异常记录和恢复机制。
+- 任务与队友配置以 `task_{id}.json`、`.team/config.json` 等 JSON 文件保存在对应子目录。`state_persistence.py` 提供共享路径锁和原子替换，程序启动时会重新读取任务文件和队友元数据，但不会恢复队友线程或对话上下文；残留的活动状态会转换为 `interrupted` 并带原因。
 
 ## 7. 部署与运行
 
@@ -307,7 +310,7 @@ python main.py
 - 上下文压缩减负：`microcompact(messages)` 会先裁剪冗长的工具输出，`auto_compact(messages)` 会在 token 超阈值时生成摘要并替换历史上下文，减少长会话对模型推理速度和内存压力的影响。
 - 保守升级策略：当嵌入服务失败、错题本命中或上下文过长时，系统直接升级到大模型，不在低质量输入上反复重试，从而减少无效请求和额外等待。
 - 本地执行超时控制：共享 `CommandExecutor` 统一设置超时、风险分级、最小环境和输出截断；后台任务复用同一执行计划，避免长时间阻塞主循环或绕过前台策略。
-- 持久化协作解耦：任务、消息、队友状态分别落在独立文件中，主循环不需要持有所有协作状态的锁，降低了同步开销。
+- 持久化协作解耦：任务、消息、队友状态分别落在独立文件中，并只在短小的文件读改写临界区内持有对应路径锁；模型调用和工具执行不占用这些状态锁。
 - 无阻塞的异步自我进化：通过 threading.RLock 与快照（Snapshot）机制的结合，将极其耗时的 LLM 经验压缩过程（约 10~20 秒）完全放置在后台守护线程执行。合并数据时使用 Python 原生的列表切片运算替代循环比对，使得主线程加锁重写内存的时间被压缩至微秒级，用户体验毫无卡顿感。
 
 ### 8.2 可扩展性（Scalability）
@@ -337,14 +340,18 @@ python main.py
 
     - 错题本以 JSONL 格式持久化（默认文件名 `mistakes.json`），由 `Claude_Router.record_mistake` 追加写入；当条目数达到 `max_mistakes`（默认 200）时，触发后台异步 LLM 压缩。压缩响应、数量和向量维度必须全部通过校验，文件原子替换成功后才更新内存；并发新增条目不会被覆盖。
 
+    - 任务创建/认领、inbox 消费和队友配置写入使用进程内共享锁与原子文件替换。Teammate 有明确的停止事件、空闲超时、失败原因和任务释放语义；主运行时退出时有界等待受管线程。
+
 - 限制：
     - 向量匹配目前通过线性扫描对 `route_embeddings` 与 `mistake_book` 逐条计算余弦相似度，复杂度为 O(n)。当前内置种子只有 81 条，继续保持线性扫描比引入 FAISS/HNSW 更简单；数据规模明显增长且基准确认扫描成为瓶颈后再评估 ANN。
     - 离线评测的 hashing embedding 是词法代理，不能作为真实语义准确率或生产阈值调整的唯一依据。
     - `estimate_tokens(messages)` 使用 `len(json.dumps(messages, default=str)) // 4` 作为简化估算，非基于真实 tokenizer 计数，可能导致触发压缩的阈值与实际 token 使用存在偏差。
+    - 当前状态锁协调的是同一 Python 进程内的线程，不是跨操作系统进程的事务锁。现有架构只有一个主进程，JSON/JSONL + 原子替换保持了低依赖和可检查性；如果后续进入真正的 daemon、多进程 worker 或需要跨多个任务文件的全有或全无事务，应迁移到 SQLite，而不是继续叠加文件锁。
+    - graceful shutdown 能取消 Teammate 的下一安全检查点并等待后台线程，但不能强制中断一个正在进行的第三方模型 HTTP 调用；后台命令的硬终止仍由 `CommandExecutor` 的命令 timeout 保证。
 
 ## 10. 测试
 
-测试采用 `pytest` 框架，共收集 91 项。默认执行 89 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过依赖注入、mock、子进程与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 91 项。
+测试采用 `pytest` 框架，共收集 107 项。默认执行 105 项离线测试并跳过 2 项真实模型 API 延迟测试；离线测试不依赖 Ollama、不调用模型 API，并通过依赖注入、mock、子进程与临时目录隔离项目运行数据。添加 `--run-api` 后才会执行全部 107 项。
 
 ### 10.1 测试文件结构
 
@@ -359,6 +366,7 @@ python main.py
 - [tests/test_embedding_service.py](tests/test_embedding_service.py) — 验证有界 LRU、失败重试、并发合并和 Router 重用
 - [tests/test_router_compression.py](tests/test_router_compression.py) — 验证压缩 schema、维度、原子写入和并发一致性
 - [tests/test_router_evaluation.py](tests/test_router_evaluation.py) — 验证评测集 schema、指标和风险加权阈值比较
+- [tests/test_state_reliability.py](tests/test_state_reliability.py) — 验证并发任务/inbox、一致性写入、状态恢复、预算、取消、任务释放、启动/关闭竞态和优雅退出（16 项）
 - [tests/conftest.py](tests/conftest.py) — 注入离线 embedding provider 并隔离文件路径，避免触发外部服务与项目运行数据写入
 
 ### 10.2 种子数据测试（4 项）

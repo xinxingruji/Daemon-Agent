@@ -1,5 +1,6 @@
 # 这里定义运行时组装、全局 Tools Schema、回调和控制台主循环。
 
+import atexit
 import json
 import sys
 import threading
@@ -32,6 +33,8 @@ TEAM = None
 # === SECTION: system_prompt ===
 SYSTEM = ""
 _runtime_lock = threading.Lock()
+_shutdown_lock = threading.Lock()
+_runtime_shutdown = False
 
 
 def initialize_runtime() -> None:
@@ -56,17 +59,38 @@ Skills: {skills.descriptions()}"""
         TODO, SKILLS, TASK_MGR = todo, skills, task_mgr
         BG, BUS, TEAM, SYSTEM = background, bus, team, system
 
+
+def shutdown_runtime(timeout: float = 5.0) -> dict[str, dict[str, int]]:
+    """Stop accepting work and wait briefly for managed worker threads."""
+    global _runtime_shutdown
+    with _shutdown_lock:
+        if _runtime_shutdown:
+            return {}
+        if TEAM is None and BG is None:
+            return {}
+        _runtime_shutdown = True
+    results = {}
+    if TEAM is not None:
+        results["teammates"] = TEAM.shutdown_all(timeout=timeout)
+    if BG is not None:
+        results["background"] = BG.shutdown(timeout=timeout)
+    return results
+
+
+atexit.register(shutdown_runtime)
+
 # === SECTION: shutdown + plan tracking (s10) ===
 shutdown_requests = {}
 plan_requests = {}
 
 # === SECTION: shutdown_protocol (s10) ===
-def handle_shutdown_request(teammate: str) -> str:
+def handle_shutdown_request(teammate: str) -> ToolResult:
     initialize_runtime()
     req_id = str(uuid.uuid4())[:8]
     shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down.", "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent to '{teammate}'"
+    result = TEAM.request_shutdown(teammate, f"shutdown request {req_id}")
+    shutdown_requests[req_id]["status"] = "requested" if result.ok else "failed"
+    return result
 
 # === SECTION: plan_approval (s10) ===
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> ToolResult:
@@ -96,7 +120,7 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
     "task_create":      lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
     "task_get":         lambda **kw: TASK_MGR.get(kw["task_id"]),
-    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
+    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by"), kw.get("failure_reason")),
     "task_list":        lambda **kw: TASK_MGR.list_all(),
     "spawn_teammate":   lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
     "list_teammates":   lambda **kw: TEAM.list_all(),
@@ -153,7 +177,7 @@ TOOLS = [
     {"name": "task_get", "description": "Get task details by ID.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
     {"name": "task_update", "description": "Update task status or dependencies.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "failed", "cancelled", "deleted"]}, "failure_reason": {"type": "string"}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
     {"name": "task_list", "description": "List all tasks.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.",
@@ -367,3 +391,4 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+    shutdown_runtime()
