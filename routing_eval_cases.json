@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "description": "Versioned small/large routing evaluation cases maintained by humans.",
+  "cases": [
+    {"id": "small-list-python", "query": "列出项目目录里的所有 Python 文件", "expected": "small", "category": "file_search", "reason": "只读文件列表任务"},
+    {"id": "small-read-readme", "query": "读取 README 并概括安装步骤", "expected": "small", "category": "file_read", "reason": "单文件读取与直接总结"},
+    {"id": "small-search-todo", "query": "搜索代码中所有 TODO 标记", "expected": "small", "category": "file_search", "reason": "确定性的文本搜索"},
+    {"id": "small-create-example", "query": "创建一个空的配置示例文件", "expected": "small", "category": "file_write", "reason": "局部且明确的文件创建"},
+    {"id": "small-rename-file", "query": "把 foo.txt 重命名为 bar.txt", "expected": "small", "category": "file_operation", "reason": "单个文件重命名"},
+    {"id": "small-write-function", "query": "写一个计算平均值的 Python 函数", "expected": "small", "category": "code_generation", "reason": "边界清晰的小函数"},
+    {"id": "small-generate-tests", "query": "为 parse_config 函数生成单元测试", "expected": "small", "category": "testing", "reason": "针对单一函数生成测试"},
+    {"id": "small-explain-command", "query": "解释这个 git status 命令怎么用", "expected": "small", "category": "explanation", "reason": "常规命令解释"},
+    {"id": "small-date", "query": "查看当前日期和时间", "expected": "small", "category": "system_info", "reason": "简单系统信息"},
+    {"id": "small-sort", "query": "对这份列表排序并去重", "expected": "small", "category": "data_transform", "reason": "明确的数据转换"},
+    {"id": "small-version", "query": "检查当前 Python 版本", "expected": "small", "category": "system_info", "reason": "只读版本检查"},
+    {"id": "small-format", "query": "格式化这个 Python 文件", "expected": "small", "category": "formatting", "reason": "单文件机械格式化"},
+
+    {"id": "large-refactor-boundaries", "query": "重构整个项目的模块边界并制定迁移顺序", "expected": "large", "category": "architecture", "reason": "跨模块重构需要全局推理"},
+    {"id": "large-microservices", "query": "设计一套微服务架构并说明服务拆分原则", "expected": "large", "category": "architecture", "reason": "系统架构设计"},
+    {"id": "large-tradeoffs", "query": "分析单体架构和微服务架构的优缺点与迁移风险", "expected": "large", "category": "tradeoff_analysis", "reason": "多维度权衡"},
+    {"id": "large-memory-leak", "query": "分析长期运行后的内存增长并找出内存泄漏点", "expected": "large", "category": "debugging", "reason": "复杂运行时诊断"},
+    {"id": "large-concurrency", "query": "重新设计并发任务调度并证明不会发生竞态条件", "expected": "large", "category": "concurrency", "reason": "并发正确性推理"},
+    {"id": "large-auth-migration", "query": "规划认证系统迁移并保证旧客户端无停机兼容", "expected": "large", "category": "migration", "reason": "跨版本迁移设计"},
+    {"id": "large-failure-recovery", "query": "审查多智能体故障恢复流程并设计一致的状态机", "expected": "large", "category": "reliability", "reason": "分布式状态与恢复推理"},
+    {"id": "large-performance", "query": "定位跨进程性能瓶颈并比较三种优化方案", "expected": "large", "category": "performance", "reason": "需要测量与多方案权衡"},
+    {"id": "large-consistency", "query": "为分布式任务系统设计事务一致性和冲突解决策略", "expected": "large", "category": "distributed_systems", "reason": "分布式一致性设计"},
+    {"id": "large-threat-model", "query": "为工具执行层建立完整威胁模型并评估绕过路径", "expected": "large", "category": "security", "reason": "系统性安全分析"},
+    {"id": "large-circular-deps", "query": "解除多个核心模块之间的循环依赖且保持公共接口兼容", "expected": "large", "category": "refactoring", "reason": "跨模块兼容性重构"},
+    {"id": "large-storage-choice", "query": "比较不同数据库方案并为高并发工作负载选择存储架构", "expected": "large", "category": "architecture", "reason": "容量、成本与一致性权衡"}
+  ]
+}

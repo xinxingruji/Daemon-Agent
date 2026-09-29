@@ -121,6 +121,7 @@ ANTHROPIC_API_KEY="sk-placeholder"
 # 可选，以下为默认值
 EMBEDDING_MODEL="nomic-embed-text-v2-moe"
 OLLAMA_EMBEDDING_URL="http://localhost:11434/api/embeddings"
+EMBEDDING_CACHE_SIZE="256"
 
 ```
 
@@ -171,7 +172,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-共收集 67 项测试。默认运行其中 65 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 67 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过 mock、子进程和临时目录隔离外部依赖。
+共收集 91 项测试。默认运行其中 89 项离线测试，并跳过 2 项真实模型 API 延迟测试；添加 `--run-api` 后运行全部 91 项。离线测试不依赖 Ollama、不调用模型 API、不写入项目运行数据，通过依赖注入、mock、子进程和临时目录隔离外部依赖。
 
 **测试内容：**
 
@@ -185,9 +186,12 @@ python -m pytest tests/ -v
 | 性能基准 | [tests/test_benchmarks.py](tests/test_benchmarks.py) | 13 | 初始化耗时、余弦速度、路由延迟、错题本规模影响、路由准确率、成本模拟、API 延迟多次测量 |
 | 缓存 schema | [tests/test_seed_cache.py](tests/test_seed_cache.py) | 6 | 元数据、旧格式兼容、模型/维度/哈希失配 |
 | 缓存预计算 | [tests/test_precompute_seeds.py](tests/test_precompute_seeds.py) | 2 | 部分失败不覆盖旧缓存、成功生成版本化缓存 |
-| 启动诊断 | [tests/test_diagnostics.py](tests/test_diagnostics.py) | 4 | 模型映射、缓存诊断、URL 与密钥脱敏 |
+| 启动诊断 | [tests/test_diagnostics.py](tests/test_diagnostics.py) | 5 | 模型映射、种子缓存、embedding LRU 容量、URL 与密钥脱敏 |
 | 导入副作用 | [tests/test_import_side_effects.py](tests/test_import_side_effects.py) | 1 | 导入 config/main 不初始化运行时或创建目录 |
 | 工具安全边界 | [tests/test_tool_safety.py](tests/test_tool_safety.py) | 20 | 结构化结果、一次性审批、无隐式 shell、环境隔离、保护路径与原子写入 |
+| Embedding 服务 | [tests/test_embedding_service.py](tests/test_embedding_service.py) | 6 | 文本规范化、有界 LRU、淘汰、失败重试、并发请求合并与 Router 复用 |
+| 压缩一致性 | [tests/test_router_compression.py](tests/test_router_compression.py) | 12 | 响应 schema、数量/去重/维度校验、原子替换、并发到达与陈旧快照保护 |
+| 路由评测 | [tests/test_router_evaluation.py](tests/test_router_evaluation.py) | 5 | 数据集 schema、代理指标、误降级/误升级与风险加权阈值比较 |
 
 **运行环境要求：**
 - 不需要启动任何外部服务（Ollama、LiteLLM 均不需要）
@@ -197,7 +201,7 @@ python -m pytest tests/ -v
 
 单独的性能基准脚本 [benchmark.py](benchmark.py)，输出格式化表格并导出 JSON 文件。
 
-#### 5.2.1 仅本地模式（推荐，无需任何外部服务）
+#### 6.2.1 仅本地模式（推荐，无需任何外部服务）
 
 ```bash
 python benchmark.py
@@ -209,7 +213,7 @@ python benchmark.py
 
 > 本地模式下 embedding 调用被 mock，只测量路由逻辑的纯计算开销，排除 Ollama 网络波动干扰。初始化耗时约 700 µs，路由决策约 400 µs。
 
-#### 5.2.2 含 API 模式（需 LiteLLM 代理在线）
+#### 6.2.2 含 API 模式（需 LiteLLM 代理在线）
 
 ```bash
 python benchmark.py --api
@@ -224,9 +228,9 @@ python benchmark.py --api
 
 **输出位置：** 同样写入 `benchmark_results.json`，包含 API 延迟数据。
 
-> 路由决策耗时在含 API 模式下会显著增加（约 4 秒），因为实际调用了 Ollama 的 `/api/embeddings` 将 query 转为向量。这部分开销来自嵌入服务，而非路由算法本身。
+> 冷查询的路由耗时会被 Ollama `/api/embeddings` 调用主导。相同的规范化 query 会命中有界 LRU，不再重复请求 Ollama；容量由 `EMBEDDING_CACHE_SIZE` 控制，设为 `0` 可关闭缓存。并发的相同 query 也会合并为一次实际请求。
 
-#### 5.2.3 输出文件说明
+#### 6.2.3 输出文件说明
 
 | 文件 | 由哪个命令生成 | 内容 |
 |------|--------------|------|
@@ -242,3 +246,14 @@ python benchmark.py --api
   ...
 ]
 ```
+
+### 6.3 离线路由评测
+
+[routing_eval_cases.json](routing_eval_cases.json) 是版本化的人工标注自然语言样本，当前包含 24 条、small/large 各 12 条。[router_eval.py](router_eval.py) 可复现地统计准确率、误降级、误升级、估算成本与纯策略延迟，并比较一组候选阈值：
+
+```bash
+python router_eval.py
+python router_eval.py --threshold 0.45 --json
+```
+
+默认离线词法代理在阈值 `0.45` 下得到 83.3% 准确率、0 次误降级、4 次误升级；风险加权比较建议 `0.40`。这里的 hashing embedding 仅用于 CI 回归趋势，不等同于生产环境语义 embedding，也不足以单独支持修改线上阈值。因此生产默认阈值仍保持 `0.45`；调整前应使用真实 Ollama embedding 和更大、来源明确的标注集复测。

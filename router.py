@@ -1,10 +1,8 @@
 import json
-import math
 import os
 import sys
-import urllib.request
 import threading
-from typing import List, Dict
+from typing import Dict, List, Mapping, Sequence
 
 # 重配 stdout 编码，防止 UTF-8 内容打印到 GBK 终端时 UnicodeEncodeError
 # 必须在任何 print() 之前执行，所以放在 router.py 最顶部
@@ -16,13 +14,23 @@ from seed_cache import (
     build_seed_cache_document,
     validate_seed_cache,
 )
+from embedding_service import DEFAULT_EMBEDDING_CACHE_SIZE, EmbeddingProvider
+from router_compression import (
+    atomic_write_json,
+    atomic_write_jsonl,
+    build_compressed_records,
+    parse_compression_response,
+)
+from routing_policy import RoutingPolicy, cosine_similarity
 
 class Claude_Router:
     def __init__(self, threshold: float = 0.45, mistake_threshold: float = 0.75,
                  mistake_file: str = "mistakes.json", seed_file: str = "seed_vectors.json",
                  safe_tokens: int = 3000, penalty_step: int = 4000, max_mistakes: int = 200,
                  model_name: str = DEFAULT_EMBEDDING_MODEL,
-                 api_url: str = DEFAULT_EMBEDDING_URL):
+                 api_url: str = DEFAULT_EMBEDDING_URL,
+                 embedding_cache_size: int = DEFAULT_EMBEDDING_CACHE_SIZE,
+                 embedding_provider: EmbeddingProvider | None = None):
         self.threshold = threshold
         self.mistake_threshold = mistake_threshold
         self.mistake_file = mistake_file
@@ -36,6 +44,18 @@ class Claude_Router:
 
         self.model_name = model_name
         self.api_url = api_url
+        self.embedding_provider = embedding_provider or EmbeddingProvider(
+            model_name=model_name,
+            api_url=api_url,
+            cache_size=embedding_cache_size,
+        )
+        self.routing_policy = RoutingPolicy(
+            threshold=threshold,
+            mistake_threshold=mistake_threshold,
+            safe_tokens=safe_tokens,
+            penalty_step=penalty_step,
+            penalty_rate=self.penalty_rate,
+        )
         self._last_alert_query = ""
         self._last_semantic_query = ""
         self._last_intercept_query = ""
@@ -131,20 +151,39 @@ class Claude_Router:
                 "未写入缓存；自动路由将保守使用 large。",
             )
 
-    def _save_seed_vectors(self):
-        """将当前种子向量写入 seed_vectors.json"""
+    def _build_seed_document(
+        self,
+        texts: Mapping[str, Sequence[str]],
+        embeddings: Mapping[str, Sequence[Sequence[float]]],
+    ) -> dict:
         entries = {"small": [], "large": []}
         for route_name in ("small", "large"):
-            for i, vec in enumerate(self.route_embeddings[route_name]):
-                text = self.route_embeddings_text[route_name][i]
+            route_texts = texts.get(route_name, ())
+            route_vectors = embeddings.get(route_name, ())
+            if len(route_texts) != len(route_vectors):
+                raise ValueError(f"{route_name} seed text/vector counts do not match")
+            for text, vec in zip(route_texts, route_vectors):
                 entries[route_name].append({"text": text, "vector": vec})
-        data = build_seed_cache_document(
+        return build_seed_cache_document(
             entries,
             embedding_model=self.model_name,
             source_routes=self.routes,
         )
-        with open(self.seed_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _save_seed_vectors_data(
+        self,
+        texts: Mapping[str, Sequence[str]],
+        embeddings: Mapping[str, Sequence[Sequence[float]]],
+    ) -> None:
+        document = self._build_seed_document(texts, embeddings)
+        atomic_write_json(self.seed_file, document)
+
+    def _save_seed_vectors(self):
+        """Atomically persist the current validated seed vectors."""
+        self._save_seed_vectors_data(
+            self.route_embeddings_text,
+            self.route_embeddings,
+        )
 
     def add_seed(self, text: str, route_name: str):
         """添加一条新种子，并支持满载自动压缩"""
@@ -195,10 +234,14 @@ class Claude_Router:
 
     def reload_seeds(self):
         """热重载 seed_vectors.json"""
-        self.route_embeddings = {"small": [], "large": []}
-        self.route_embeddings_text = {"small": [], "large": []}
-        self._load_seed_vectors()
+        with self.seed_lock:
+            self.route_embeddings = {"small": [], "large": []}
+            self.route_embeddings_text = {"small": [], "large": []}
+            self._load_seed_vectors()
         print("[Router] 种子库已热更新")
+
+    def embedding_cache_stats(self) -> dict[str, int | float]:
+        return self.embedding_provider.stats().to_dict()
 
     def _load_mistakes(self) -> List[Dict]:
         """从本地 JSONL 文件逐行加载错题本"""
@@ -235,134 +278,165 @@ class Claude_Router:
             if len(self.mistake_book) >= self.max_mistakes and not self.is_compressing_mistakes:
                 self._trigger_compression_async(target="mistake")
         
-    def _trigger_compression_async(self, target: str):
-        """统一的后台大模型提炼压缩机制 (支持错题本和种子库)"""
-        
-        # 1. 状态锁定与快照获取
+    def _embedding_dimension(self) -> int:
+        for route_name in ("small", "large"):
+            for vector in self.route_embeddings.get(route_name, ()):
+                if vector:
+                    return len(vector)
+        for record in self.mistake_book:
+            vector = record.get("vector", [])
+            if vector:
+                return len(vector)
+        raise ValueError("cannot compress without a known embedding dimension")
+
+    @staticmethod
+    def _compression_prompt(target: str, snapshot: list) -> str:
         if target == "mistake":
-            self.is_compressing_mistakes = True
+            queries_text = "\n".join(f"- {item['query']}" for item in snapshot)
+            return f"""
+            以下是导致小型AI模型失败的指令清单：
+            {queries_text}
+            请将这些指令抽象并合并为 10-20 个涵盖这些核心难点的通用指令。
+            请严格以 JSON 数组的格式输出纯字符串列表（不要有Markdown代码块格式）。
+            """
+        queries_text = "\n".join(f"- {query}" for query in snapshot)
+        return f"""
+        以下是小型AI模型近期成功处理的 {len(snapshot)} 个具体任务指令：
+        {queries_text}
+        请提取它们背后的核心意图，泛化为 5 到 8 个代表性的通用指令。
+        请严格以 JSON 数组的格式输出纯字符串列表（不要有Markdown代码块格式）。
+        """
+
+    def _apply_compressed_mistakes(self, snapshot: list, records: list[dict]) -> None:
+        with self.mistake_lock:
+            if self.mistake_book[:len(snapshot)] != snapshot:
+                raise RuntimeError("mistake snapshot changed during compression")
+            new_arrivals = self.mistake_book[len(snapshot):]
+            candidate = records + new_arrivals
+            atomic_write_jsonl(self.mistake_file, candidate)
+            self.mistake_book = candidate
+
+    def _apply_compressed_seeds(self, snapshot: list, records: list[dict]) -> None:
+        with self.seed_lock:
+            base_count = self.base_small_count
+            snapshot_count = len(snapshot)
+            current_snapshot = self.route_embeddings_text["small"][
+                base_count:base_count + snapshot_count
+            ]
+            if current_snapshot != snapshot:
+                raise RuntimeError("seed snapshot changed during compression")
+            candidate_texts = {
+                name: list(values)
+                for name, values in self.route_embeddings_text.items()
+            }
+            candidate_vectors = {
+                name: [list(vector) for vector in values]
+                for name, values in self.route_embeddings.items()
+            }
+            candidate_texts["small"] = (
+                candidate_texts["small"][:base_count]
+                + [record["query"] for record in records]
+                + candidate_texts["small"][base_count + snapshot_count:]
+            )
+            candidate_vectors["small"] = (
+                candidate_vectors["small"][:base_count]
+                + [record["vector"] for record in records]
+                + candidate_vectors["small"][base_count + snapshot_count:]
+            )
+            self._save_seed_vectors_data(candidate_texts, candidate_vectors)
+            self.route_embeddings_text = candidate_texts
+            self.route_embeddings = candidate_vectors
+
+    def _trigger_compression_async(self, target: str):
+        """Compress one consistent snapshot and replace it only after validation."""
+        if target == "mistake":
             with self.mistake_lock:
+                if self.is_compressing_mistakes:
+                    return
+                self.is_compressing_mistakes = True
                 snapshot = self.mistake_book.copy()
         elif target == "seed":
-            self.is_compressing_seeds = True
             with self.seed_lock:
-                # 切片魔法：只拿 [保护底座N 之后] 的所有动态种子去压缩
+                if self.is_compressing_seeds:
+                    return
+                self.is_compressing_seeds = True
                 snapshot = self.route_embeddings_text["small"][self.base_small_count:].copy()
+        else:
+            raise ValueError(f"unsupported compression target: {target}")
 
         def _compress_task():
-            from config import get_client
-            client = get_client()
-            
             try:
-                print(f"\n[Router ⚙️] 启动后台 LLM {target} 压缩机制 (处理 {len(snapshot)} 条数据)...")
-                
-                # 2. 依据 target 动态构建 Prompt
-                if target == "mistake":
-                    queries_text = "\n".join(f"- {m['query']}" for m in snapshot)
-                    prompt = f"""
-                    以下是导致小型AI模型失败的指令清单：
-                    {queries_text}
-                    请将这些指令抽象并合并为 10-20 个涵盖这些核心难点的通用指令。
-                    请严格以 JSON 数组的格式输出纯字符串列表（不要有Markdown代码块格式）。
-                    例如：["重构复杂的微服务架构代码", "分析并修复底层的内存泄漏"]
-                    """
-                else: # target == "seed"
-                    queries_text = "\n".join(f"- {q}" for q in snapshot)
-                    prompt = f"""
-                    以下是小型AI模型近期成功处理的 {len(snapshot)} 个具体任务指令：
-                    {queries_text}
-                    这些指令过于零散。请提取它们背后的“核心意图”，泛化为 5 到 8 个代表性的通用指令。
-                    请严格以 JSON 数组的格式输出纯字符串列表（不要有Markdown代码块格式）。
-                    例如：["解析并重构前端页面的组件结构", "生成特定业务模块的自动化单元测试"]
-                    """
+                from config import get_client
 
-                # 3. 【复用区域】统一调用大模型、洗白与解析
-                resp = client.messages.create(
-                    model="large", 
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=1000
+                print(
+                    f"\n[Router ⚙️] 启动后台 LLM {target} 压缩机制 "
+                    f"(处理 {len(snapshot)} 条数据)...",
                 )
-                
-                raw_text = resp.content[0].text.strip()
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.strip("`").replace("json\n", "", 1).strip()
-                    
-                abstract_queries = json.loads(raw_text)
-                print(f"[Router ✨] {target} 提炼完成！提取了 {len(abstract_queries)} 条高度概括的经验。")
-                
-                # 统一向量化大模型的产出
-                compressed_records = []
-                for q in abstract_queries:
-                    vec = self._get_embedding(q)
-                    if vec:
-                        compressed_records.append({"query": q, "vector": vec})
+                client = get_client()
+                response = client.messages.create(
+                    model="large",
+                    messages=[{
+                        "role": "user",
+                        "content": self._compression_prompt(target, snapshot),
+                    }],
+                    max_tokens=1000,
+                )
+                if not response.content or not hasattr(response.content[0], "text"):
+                    raise ValueError("compression model returned no text content")
+                abstract_queries = parse_compression_response(
+                    response.content[0].text,
+                    target,
+                )
+                compressed_records = build_compressed_records(
+                    abstract_queries,
+                    embedding_getter=self._get_embedding,
+                    expected_dimension=self._embedding_dimension(),
+                )
 
-                # 4. 【分叉区域】统一使用切片算法完成无缝替换
                 if target == "mistake":
-                    with self.mistake_lock:
-                        # 错题本：压缩后的 + 压缩期间新产生的
-                        new_arrivals = self.mistake_book[len(snapshot):]
-                        self.mistake_book = compressed_records + new_arrivals
-                        
-                        with open(self.mistake_file, 'w', encoding='utf-8') as f:
-                            for r in self.mistake_book:
-                                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-                    print(f"[Router ✅] 错题本已成功净化，当前容量: {len(self.mistake_book)}")
-
-                elif target == "seed":
-                    with self.seed_lock:
-                        # 种子库切片合并原理：
-                        # [0 : N] -> 我们要保护的 utterances.py 出厂基因
-                        # [N : N + len(snapshot)] -> 被大模型压缩掉的旧快照 (丢弃)
-                        # [N + len(snapshot) : ] -> 压缩这十几秒内，主线程新塞进来的种子
-                        
-                        N = self.base_small_count
-                        S = len(snapshot)
-                        
-                        base_texts = self.route_embeddings_text["small"][:N]
-                        base_vecs = self.route_embeddings["small"][:N]
-                        
-                        new_arrivals_texts = self.route_embeddings_text["small"][N + S:]
-                        new_arrivals_vecs = self.route_embeddings["small"][N + S:]
-                        
-                        compressed_texts = [r["query"] for r in compressed_records]
-                        compressed_vecs = [r["vector"] for r in compressed_records]
-
-                        # 拼接：基础底座 + 刚刚提炼的高级锚点 + 还没来得及提炼的新货
-                        self.route_embeddings_text["small"] = base_texts + compressed_texts + new_arrivals_texts
-                        self.route_embeddings["small"] = base_vecs + compressed_vecs + new_arrivals_vecs
-                        
-                        self._save_seed_vectors()
-                    print(f"[Router ✅] 种子库已成功净化，当前 small 容量: {len(self.route_embeddings['small'])}")
-
+                    self._apply_compressed_mistakes(snapshot, compressed_records)
+                    current_size = len(self.mistake_book)
+                else:
+                    self._apply_compressed_seeds(snapshot, compressed_records)
+                    current_size = len(self.route_embeddings["small"])
+                print(
+                    f"[Router ✅] {target} 压缩通过完整校验并原子写回，"
+                    f"当前容量: {current_size}",
+                )
             except Exception as e:
                 print(f"\n[Router ❌] 后台 {target} 压缩失败 (保持原有状态): {e}")
             finally:
                 if target == "mistake":
-                    self.is_compressing_mistakes = False
-                elif target == "seed":
-                    self.is_compressing_seeds = False
+                    with self.mistake_lock:
+                        self.is_compressing_mistakes = False
+                else:
+                    with self.seed_lock:
+                        self.is_compressing_seeds = False
 
-        # 启动守护线程
-        threading.Thread(target=_compress_task, daemon=True).start()
+        try:
+            threading.Thread(target=_compress_task, daemon=True).start()
+        except Exception:
+            if target == "mistake":
+                with self.mistake_lock:
+                    self.is_compressing_mistakes = False
+            else:
+                with self.seed_lock:
+                    self.is_compressing_seeds = False
+            raise
 
     def _get_embedding(self, text: str) -> List[float]:
-        # ... (与之前代码完全一致，调用 Ollama API) ...
-        payload = {"model": self.model_name, "prompt": text}
-        try:
-            req = urllib.request.Request(self.api_url, data=json.dumps(payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=60) as response:
-                return json.loads(response.read().decode('utf-8'))['embedding']
-        except:
-            return []
+        return self.embedding_provider.get(text)
 
     def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        # ... (与之前代码完全一致的数学计算) ...
-        if not vec1 or not vec2: return 0.0
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = math.sqrt(sum(a * a for a in vec1))
-        norm2 = math.sqrt(sum(b * b for b in vec2))
-        return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
+        return cosine_similarity(vec1, vec2)
+
+    def _sync_routing_policy(self) -> None:
+        """Preserve compatibility with callers that tune Router attributes."""
+        self.routing_policy.threshold = self.threshold
+        self.routing_policy.mistake_threshold = self.mistake_threshold
+        self.routing_policy.safe_tokens = self.safe_tokens
+        self.routing_policy.penalty_step = self.penalty_step
+        self.routing_policy.penalty_rate = self.penalty_rate
 
     def route(self, query: str, total_tokens: int = 0, force_large: bool = False,
               force_small: bool = False) -> str:
@@ -382,64 +456,62 @@ class Claude_Router:
         # 存储供外部反馈使用
         self._last_query_vector = query_vector
 
-        # ==========================================
-        # 🚨 第一道防线：检查错题本
-        # ==========================================
-        for mistake in self.mistake_book:
-            sim = self._cosine_similarity(query_vector, mistake["vector"])
-            if sim >= self.mistake_threshold:
-                if query != self._last_alert_query:
-                    print(f"\033[31m[Router 警报] 触发错题拦截！强制拉起大模型！\033[0m")
-                    self._last_alert_query = query
-                return "large"
+        with self.mistake_lock:
+            mistake_vectors = [
+                item.get("vector", [])
+                for item in self.mistake_book
+                if isinstance(item, dict)
+            ]
+        with self.seed_lock:
+            route_embeddings = {
+                name: list(vectors)
+                for name, vectors in self.route_embeddings.items()
+            }
+        self._sync_routing_policy()
+        decision = self.routing_policy.decide(
+            query_vector,
+            route_embeddings=route_embeddings,
+            mistake_vectors=mistake_vectors,
+            total_tokens=total_tokens,
+        )
+        self._last_route_scores = decision.route_scores
+        self._last_best_route = decision.best_route
 
-        # ==========================================
-        # 🟢 第二道防线：常规语义评估
-        # ==========================================
-        best_route = "large"
-        highest_score = 0.0
-        self._last_route_scores = {"small": 0.0, "large": 0.0}
+        if decision.intercepted_by_mistake:
+            if query != self._last_alert_query:
+                print("\033[31m[Router 警报] 触发错题拦截！强制拉起大模型！\033[0m")
+                self._last_alert_query = query
+            return "large"
 
-        for route_name, embeddings in self.route_embeddings.items():
-            for emb in embeddings:
-                score = self._cosine_similarity(query_vector, emb)
-                if score > self._last_route_scores.get(route_name, 0.0):
-                    self._last_route_scores[route_name] = score
-                if score > highest_score:
-                    highest_score = score
-                    best_route = route_name
-
-        # [优化点] 如果判定为大模型任务，或者最高分数连基础及格线都没过，直接扔给大模型
-        if best_route == "large" or highest_score < self.threshold:
+        if decision.best_route == "large" or decision.highest_score < self.threshold:
             if query != self._last_semantic_query:
-                print(f"\033[36m[SemanticRouter] 匹配分数: {highest_score:.3f} -> 判定为大型任务或未达基础线，路由至: large\033[0m")
+                print(
+                    f"\033[36m[SemanticRouter] 匹配分数: "
+                    f"{decision.highest_score:.3f} -> 判定为大型任务或未达基础线，"
+                    "路由至: large\033[0m",
+                )
                 self._last_semantic_query = query
             return "large"
 
-        # ==========================================
-        # 📈 第三道防线：动态 Token 惩罚计算
-        # (运行到这里，说明 best_route == "small" 且 highest_score >= self.threshold)
-        # ==========================================
-        dynamic_threshold = self.threshold
-
-        if total_tokens > self.safe_tokens:
-            extra_steps = (total_tokens - self.safe_tokens) // self.penalty_step
-            penalty = extra_steps * self.penalty_rate
-            dynamic_threshold = min(0.99, self.threshold + penalty)
-
-            if penalty > 0:
-                print(f"\033[33m[Router 测算] 上下文较长 ({total_tokens} tokens)，小模型及格线已从 {self.threshold} 动态上调至 {dynamic_threshold:.3f}\033[0m")
+        if decision.dynamic_threshold > self.threshold:
+            print(
+                f"\033[33m[Router 测算] 上下文较长 ({total_tokens} tokens)，"
+                f"小模型及格线已从 {self.threshold} 动态上调至 "
+                f"{decision.dynamic_threshold:.3f}\033[0m",
+            )
 
         if query != self._last_semantic_query:
-            print(f"\033[36m[SemanticRouter] 最终评估: 语义得分 {highest_score:.3f} vs 动态及格线 {dynamic_threshold:.3f}\033[0m")
+            print(
+                f"\033[36m[SemanticRouter] 最终评估: 语义得分 "
+                f"{decision.highest_score:.3f} vs 动态及格线 "
+                f"{decision.dynamic_threshold:.3f}\033[0m",
+            )
             self._last_semantic_query = query
 
-        # 终极裁决
-        self._last_best_route = best_route
-        if highest_score >= dynamic_threshold:
+        if decision.route == "small":
             return "small"
 
-        if query != self._last_intercept_query:
-            print(f"\033[35m[Router 拦截] 小模型得分不足以抵抗长文本衰减，升级为大模型！\033[0m")
+        if decision.intercepted_by_context and query != self._last_intercept_query:
+            print("\033[35m[Router 拦截] 小模型得分不足以抵抗长文本衰减，升级为大模型！\033[0m")
             self._last_intercept_query = query
         return "large"

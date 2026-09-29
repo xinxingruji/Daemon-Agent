@@ -7,6 +7,7 @@ from typing import Callable
 
 from router import Claude_Router
 from seed_cache import DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_URL
+from embedding_service import DEFAULT_EMBEDDING_CACHE_SIZE
 
 WORKDIR = Path.cwd()
 
@@ -77,9 +78,20 @@ def get_router() -> Claude_Router:
     with _router_lock:
         if _router_instance is None:
             load_runtime_env()
+            raw_cache_size = os.getenv(
+                "EMBEDDING_CACHE_SIZE",
+                str(DEFAULT_EMBEDDING_CACHE_SIZE),
+            )
+            try:
+                embedding_cache_size = int(raw_cache_size)
+            except ValueError as exc:
+                raise RuntimeError("EMBEDDING_CACHE_SIZE must be an integer") from exc
+            if embedding_cache_size < 0:
+                raise RuntimeError("EMBEDDING_CACHE_SIZE must be non-negative")
             _router_instance = Claude_Router(
                 model_name=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
                 api_url=os.getenv("OLLAMA_EMBEDDING_URL", DEFAULT_EMBEDDING_URL),
+                embedding_cache_size=embedding_cache_size,
             )
     return _router_instance
 

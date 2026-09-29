@@ -1,6 +1,7 @@
 import json
 
 from diagnostics import (
+    check_embedding_cache_size,
     check_model_mapping,
     check_seed_cache,
     render_diagnostics,
@@ -67,6 +68,13 @@ def test_seed_cache_diagnostic_reports_versioned_cache(tmp_path):
 
     assert result.status == "ok"
     assert "dimension=2" in result.message
+
+
+def test_embedding_cache_size_diagnostic():
+    assert check_embedding_cache_size("256").status == "ok"
+    assert check_embedding_cache_size("0").status == "ok"
+    assert check_embedding_cache_size("-1").status == "error"
+    assert check_embedding_cache_size("many").status == "error"
 
 
 def test_diagnostics_never_render_env_secret(tmp_path):
